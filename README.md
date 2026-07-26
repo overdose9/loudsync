@@ -43,7 +43,8 @@ There's also an `_secrets/` escape-hatch folder that never leaves the machine.
 
 Note the honest limitation: **this filters by file name, not by content.** A
 password pasted inside a `.docx` still gets uploaded. The filters buy you the
-common cases, not absolution.
+common cases, not absolution. What you store in your files is exclusively your
+responsibility.
 
 **3. It fails loudly, and safely.**
 
