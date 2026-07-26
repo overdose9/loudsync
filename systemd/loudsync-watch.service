@@ -1,0 +1,14 @@
+[Unit]
+Description=loudsync watcher — triggers a sync when local files change
+Documentation=https://github.com/overdose9/loudsync
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=@BINDIR@/loudsync-watch
+Restart=always
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=default.target

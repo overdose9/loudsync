@@ -1,0 +1,113 @@
+# Base filters for loudsync. This file IS meant to be edited by hand.
+#
+# Git repository exclusions are generated automatically on every run and merged
+# in ahead of these rules, so you never need to list a repo here.
+#
+# rclone syntax: "- pattern" excludes. A pattern with no "/" matches at any
+# depth. Order matters: the first rule that matches wins.
+
+# --- Secrets: these never leave the machine ---------------------------------
+#
+# HEADS UP: this filters by FILE NAME, not by content. A password pasted inside
+# a .md, a .docx or a screenshot still gets uploaded. For anything you know is
+# secret, use the _secrets/ folder (excluded further down).
+
+# Environment files
+- .env
+- *.env
+- .env.*
+
+# Keys and certificates
+- *.key
+- *.pem
+- *.p12
+- *.pfx
+- *.jks
+- *.keystore
+- *.ppk
+- id_rsa*
+- id_dsa*
+- id_ecdsa*
+- id_ed25519*
+- *.gpg
+- *.asc
+- .ssh/**
+- .gnupg/**
+
+# Service credentials in JSON (Google, Firebase, AWS...)
+- *credential*.json
+- *secret*.json
+- *service-account*.json
+- *-adminsdk-*.json
+# Careful with tokens: brand "design tokens" are legitimate content, which is
+# why there is no *token*.json wildcard here. Only credential-shaped names:
+- token.json
+- tokens.json
+- access_token*.json
+- refresh_token*.json
+- .aws/**
+- .config/gcloud/**
+
+# Credential files with no extension or a name of their own
+- .netrc
+- .pgpass
+- .htpasswd
+- .npmrc
+- .pypirc
+- .my.cnf
+- credentials
+- authorized_keys
+- known_hosts
+
+# VPN
+- *.ovpn
+- wg*.conf
+
+# Database dumps: these can carry customer data
+- *.sql
+- *.dump
+- *.bak
+
+# Escape hatch: anything you drop in here stays on this machine. For what you
+# know is secret but doesn't match any pattern above.
+- _secrets/**
+- **/_secrets/**
+
+# --- Databases: back these up properly, not through a two-way sync ----------
+- *.db
+- *.sqlite
+- *.sqlite3
+- *.db-journal
+
+# --- Regenerable: rebuilt by npm install / pip install ----------------------
+- node_modules/**
+- venv/**
+- .venv/**
+- __pycache__/**
+- *.pyc
+- dist/**
+- build/**
+- target/**
+- .astro/**
+- .next/**
+- .pytest_cache/**
+- .mypy_cache/**
+- .ruff_cache/**
+
+# --- Machine-local tool config (absolute paths from this machine) -----------
+- .claude/**
+- .cursorrules
+- .vscode/**
+- .idea/**
+- .direnv/**
+
+# --- System noise and temporary files ---------------------------------------
+- .Trash*/**
+- .directory
+- *.tmp
+- *.swp
+- *.swo
+- *~
+- ~$*
+- .DS_Store
+- Thumbs.db

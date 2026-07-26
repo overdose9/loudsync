@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+#
+# loudsync — two-way sync between a local folder and any rclone remote.
+#
+# Three things it does that generic sync tools don't:
+#
+#   1. Git repositories are detected on every run and excluded. Their backup is
+#      the remote you already push to. Two-way syncing a .git/ directory
+#      corrupts the index and the object store when both sides write, or when
+#      an upload is cut halfway through.
+#
+#   2. Secrets are excluded by filename before the first upload, not after the
+#      incident. See the shipped filter file.
+#
+#   3. It is loud. A backup that fails silently is worse than no backup,
+#      because it buys you confidence you haven't earned.
+#
+# Usage:
+#   loudsync                    normal run (this is what systemd calls)
+#   loudsync --resync           first run, or to rebuild sync state
+#   loudsync --dry-run          show what would happen, change nothing
+#   loudsync --propagate-rename you renamed a folder containing a git repo
+#   loudsync --status           show current state and exit
+#
+# Any other flag is passed straight through to `rclone bisync`.
+#
+# Copyright (C) 2026 Sebastián Flores
+# Licensed under the GNU General Public License v3.0 or later.
+
+set -euo pipefail
+
+VERSION="0.1.0"
+
+# --- Configuration ----------------------------------------------------------
+#
+# Everything below can be overridden from the config file. Only LOCAL_DIR and
+# REMOTE are required; the rest have defaults that suit a laptop.
+
+CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}/loudsync"
+STATE_HOME="${XDG_STATE_HOME:-${HOME}/.local/state}/loudsync"
+CONFIG_FILE="${LOUDSYNC_CONFIG:-${CONFIG_HOME}/loudsync.conf}"
+
+LOCAL_DIR=""
+REMOTE=""
+RCLONE_BIN=""
+FILTERS_BASE="${CONFIG_HOME}/filters-base.txt"
+MAX_DELETE_PERCENT=50   # bisync reads this as a percentage, not a file count
+CONFLICT_RESOLVE="newer"
+KEEP_LOCAL_VERSIONS=1   # keep a copy of local files overwritten from the remote
+MAX_REPO_DEPTH=8        # how deep to look for .git directories
+FAIL_THRESHOLD=3        # consecutive failures before the first alert
+REMIND_EVERY=60         # after that, remind once every N failures
+TRANSFERS=8
+CHECKERS=16
+NOTIFY=1
+
+if [ -f "${CONFIG_FILE}" ]; then
+    # shellcheck source=/dev/null
+    . "${CONFIG_FILE}"
+else
+    echo "loudsync: no config file at ${CONFIG_FILE}" >&2
+    echo "Run install.sh, or copy config/loudsync.conf.example there." >&2
+    exit 1
+fi
+
+# Expand a leading ~ so the config file can be written the way people think.
+LOCAL_DIR="${LOCAL_DIR/#\~/${HOME}}"
+
+# Finding rclone is worth doing properly: systemd --user starts with a minimal
+# PATH, and a per-user install in ~/.local/bin is the common case.
+if [ -z "${RCLONE_BIN}" ]; then
+    for candidate in "${HOME}/.local/bin/rclone" /usr/bin/rclone /usr/local/bin/rclone; do
+        [ -x "${candidate}" ] && { RCLONE_BIN="${candidate}"; break; }
+    done
+    [ -z "${RCLONE_BIN}" ] && RCLONE_BIN="$(command -v rclone || true)"
+fi
+
+FILTERS="${STATE_HOME}/filters-generated.txt"
+LOG="${STATE_HOME}/loudsync.log"
+LOCK="${STATE_HOME}/loudsync.lock"
+FAILURES="${STATE_HOME}/consecutive-failures"
+
+# Memory of the last good run's filters, so that when rclone refuses to run we
+# can say exactly what changed instead of reconstructing it afterwards.
+REPOS_CURRENT="${STATE_HOME}/repos-current.txt"
+REPOS_PREVIOUS="${STATE_HOME}/repos-previous.txt"
+BASE_MD5="${STATE_HOME}/filters-base.md5"
+
+TODAY="$(date +%Y-%m-%d)"
+# Versioned copies of local files that were overwritten by the remote.
+#
+# This covers the one case nothing else covers: a change pulled from the remote
+# overwriting your local version. The remote's own trash and revision history
+# don't help there, because the file that got overwritten is yours.
+#
+# The remote side is deliberately NOT versioned (no --backup-dir2): most
+# providers already keep revisions and a trash bin, so duplicating that only
+# burns quota and grows a dated folder nobody will ever prune.
+LOCAL_VERSIONS_DIR="${STATE_HOME}/versions/${TODAY}"
+
+mkdir -p "${STATE_HOME}" "${CONFIG_HOME}"
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') | $*" >>"${LOG}"; }
+
+read_failures() { cat "${FAILURES}" 2>/dev/null || echo 0; }
+
+# Desktop alert. This exists because the author's previous backup was dead for
+# a month without anyone noticing.
+notify() {
+    local urgency="$1" title="$2" body="$3" icon="$4"
+    [ "${NOTIFY}" -eq 1 ] || return 0
+    command -v notify-send >/dev/null 2>&1 || return 0
+    # systemd --user does not always inherit these two, and notify-send is
+    # useless without them.
+    export DISPLAY="${DISPLAY:-:0}"
+    export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}"
+    notify-send -u "${urgency}" -i "${icon}" -a "loudsync" \
+        "${title}" "${body}" 2>/dev/null || true
+}
+
+# Being offline is normal on a laptop and is not a failure worth alerting on.
+have_network() { ping -c1 -W2 8.8.8.8 >/dev/null 2>&1; }
+
+die() { log "ERROR: $*"; echo "loudsync: $*" >&2; exit 1; }
+
+# --- Preflight --------------------------------------------------------------
+
+[ -n "${LOCAL_DIR}" ] || die "LOCAL_DIR is not set in ${CONFIG_FILE}"
+[ -n "${REMOTE}" ]    || die "REMOTE is not set in ${CONFIG_FILE}"
+[ -n "${RCLONE_BIN}" ] && [ -x "${RCLONE_BIN}" ] || die "rclone not found. Install it from https://rclone.org/install/"
+[ -d "${LOCAL_DIR}" ] || die "local folder does not exist: ${LOCAL_DIR}"
+[ -f "${FILTERS_BASE}" ] || die "missing filter file: ${FILTERS_BASE}"
+
+REMOTE_NAME="${REMOTE%%:*}"
+if ! "${RCLONE_BIN}" listremotes 2>/dev/null | grep -q "^${REMOTE_NAME}:"; then
+    die "rclone remote '${REMOTE_NAME}' is not configured. Run: rclone config"
+fi
+
+# --- Status -----------------------------------------------------------------
+
+if [ "${1:-}" = "--status" ]; then
+    echo "loudsync ${VERSION}"
+    echo "  local:    ${LOCAL_DIR}"
+    echo "  remote:   ${REMOTE}"
+    echo "  rclone:   ${RCLONE_BIN}"
+    echo "  config:   ${CONFIG_FILE}"
+    echo "  log:      ${LOG}"
+    echo "  failures: $(read_failures) in a row"
+    if [ -s "${REPOS_PREVIOUS}" ]; then
+        echo "  excluded git repos: $(wc -l <"${REPOS_PREVIOUS}")"
+    fi
+    if [ -f "${LOG}" ]; then
+        echo "  last run: $(grep -E '===== (DONE|FAILED)' "${LOG}" | tail -1 || echo 'never')"
+    fi
+    exit 0
+fi
+
+if [ "${1:-}" = "--version" ]; then
+    echo "loudsync ${VERSION}"
+    exit 0
+fi
+
+# One instance at a time: the watcher and the timer can easily collide.
+exec 9>"${LOCK}"
+if ! flock -n 9; then
+    log "A sync is already running; skipping this one."
+    exit 0
+fi
+
+# --- Filters: git repos discovered on every run -----------------------------
+
+( cd "${LOCAL_DIR}" && find . -maxdepth "${MAX_REPO_DEPTH}" -name ".git" -prune 2>/dev/null ) \
+    | sed 's|^\./||; s|/\.git$||; /^$/d' | sort >"${REPOS_CURRENT}"
+
+{
+    echo "# GENERATED FILE — do not edit, it is rewritten on every run."
+    echo "# Edit ${FILTERS_BASE} instead."
+    echo "#"
+    echo "# Git repositories, excluded automatically (their backup is the git remote):"
+    sed 's|^|- /|; s|$|/**|' "${REPOS_CURRENT}"
+    echo
+    cat "${FILTERS_BASE}"
+} >"${FILTERS}"
+
+REPO_COUNT=$(wc -l <"${REPOS_CURRENT}")
+
+# --- When the filters change ------------------------------------------------
+#
+# rclone bisync stores a hash of the filter file and ABORTS if it changes: a
+# different filter could make it read an exclusion as a mass deletion. Since
+# the repo list is regenerated on every run, a single new repo used to leave
+# the sync dead until somebody ran --resync by hand.
+#
+# The two situations don't carry the same risk, so they aren't treated alike:
+#
+#   Repos were only ADDED  ->  automatic --resync. This is safe: excluding a
+#     folder deletes nothing on the other side, it just stops being synced.
+#
+#   A repo left the list, or the base filter file was edited  ->  NOT
+#     automated. A path that disappears is usually a rename, and a blind
+#     --resync then pulls the old-named folder back down from the remote and
+#     leaves you with both. Use --propagate-rename for that.
+AUTO_RESYNC=0
+MANUAL_REASON=""
+BASE_MD5_NOW="$(md5sum "${FILTERS_BASE}" | cut -d' ' -f1)"
+BASE_MD5_PREV="$(cat "${BASE_MD5}" 2>/dev/null || true)"
+
+DRY=0
+WANTS_RESYNC=0
+RENAME_MODE=0
+YES_ARGS=()
+ARGS=()
+for arg in "$@"; do
+    case "${arg}" in
+        --dry-run|-n)       DRY=1;         ARGS+=("${arg}") ;;
+        --resync)           WANTS_RESYNC=1; ARGS+=("${arg}") ;;
+        --propagate-rename) RENAME_MODE=1 ;;
+        --yes|-y)           YES_ARGS=(--yes) ;;
+        *)                                 ARGS+=("${arg}") ;;
+    esac
+done
+
+if [ "${WANTS_RESYNC}" -eq 0 ] && [ "${RENAME_MODE}" -eq 0 ] \
+   && [ -s "${REPOS_PREVIOUS}" ] && [ -n "${BASE_MD5_PREV}" ]; then
+    GONE="$(comm -23 "${REPOS_PREVIOUS}" "${REPOS_CURRENT}")"
+    ADDED="$(comm -13 "${REPOS_PREVIOUS}" "${REPOS_CURRENT}")"
+
+    if [ "${BASE_MD5_NOW}" != "${BASE_MD5_PREV}" ]; then
+        MANUAL_REASON="${FILTERS_BASE} was edited"
+    elif [ -n "${GONE}" ]; then
+        MANUAL_REASON="these repos left the list (renamed?): $(printf '%s' "${GONE}" | tr '\n' ' ')"
+    elif [ -n "${ADDED}" ]; then
+        AUTO_RESYNC=1
+        log "Newly excluded repos: $(printf '%s' "${ADDED}" | tr '\n' ' ')"
+        log "Filters only grew, reconciling with an automatic --resync."
+    fi
+
+    # Alert as soon as it is detected rather than waiting for the failure
+    # threshold: the generic message doesn't say what to do, and here we know.
+    if [ -n "${MANUAL_REASON}" ]; then
+        log "ATTENTION: filters changed and this needs a human: ${MANUAL_REASON}"
+        log "Sync is stopped until it is resolved. In a terminal, run:"
+        log "    $0 --propagate-rename"
+        log "It compares both sides, shows what it would rename on the remote,"
+        log "and applies it after you confirm. If nothing was renamed, it just"
+        log "reconciles."
+        if [ "$(read_failures)" -eq 0 ]; then
+            notify critical "Sync stopped: the filter list changed" \
+                "${MANUAL_REASON}. Nothing was deleted. To fix it, run in a terminal: loudsync --propagate-rename" \
+                dialog-error
+        fi
+    fi
+fi
+
+# --- Rename propagation -----------------------------------------------------
+#
+# For the case this script deliberately refuses to automate. Rename on the
+# remote first (server-side, no data transferred), reconcile second. The other
+# order leaves both copies of the folder.
+if [ "${RENAME_MODE}" -eq 1 ]; then
+    HELPER="$(dirname "$(readlink -f "$0")")/loudsync-rename"
+    [ -f "${HELPER}" ] || die "missing helper: ${HELPER}"
+    log "Running --propagate-rename."
+    set +e
+    python3 "${HELPER}" "${RCLONE_BIN}" "${LOCAL_DIR}" "${REMOTE}" "${FILTERS}" "${YES_ARGS[@]}"
+    HELPER_STATUS=$?
+    set -e
+    case ${HELPER_STATUS} in
+        0) AUTO_RESYNC=1
+           log "Renames are up to date, reconciling with --resync." ;;
+        2) log "Cancelled by the user, nothing was touched."
+           exit 0 ;;
+        *) log "Rename propagation failed (exit ${HELPER_STATUS})."
+           exit 1 ;;
+    esac
+fi
+
+# Written as an if rather than "cond && EXTRA=(...)": under set -e, an && list
+# whose result is false terminates the script.
+EXTRA=()
+if [ "${AUTO_RESYNC}" -eq 1 ]; then
+    EXTRA=(--resync --resync-mode newer)
+fi
+
+BACKUP=()
+if [ "${KEEP_LOCAL_VERSIONS}" -eq 1 ]; then
+    BACKUP=(--backup-dir1 "${LOCAL_VERSIONS_DIR}")
+fi
+
+# bisync refuses to start if the remote path doesn't exist yet, which makes a
+# first run fail with a confusing "directory not found". Create it — but only
+# on an explicit resync. During a normal run a missing remote path means
+# something actually went wrong, and papering over that would hide it.
+if [ "${WANTS_RESYNC}" -eq 1 ] || [ "${AUTO_RESYNC}" -eq 1 ]; then
+    if ! "${RCLONE_BIN}" lsf --max-depth 1 "${REMOTE}" >/dev/null 2>&1; then
+        log "Remote path does not exist yet, creating it: ${REMOTE}"
+        echo "Creating remote path: ${REMOTE}"
+        "${RCLONE_BIN}" mkdir "${REMOTE}" \
+            || die "could not create remote path ${REMOTE} — check the name in ${CONFIG_FILE}"
+    fi
+fi
+
+# --- Sync -------------------------------------------------------------------
+
+log "===== START (${REPO_COUNT} repos excluded) ====="
+
+set +e
+"${RCLONE_BIN}" bisync "${LOCAL_DIR}" "${REMOTE}" \
+    --filters-file "${FILTERS}" \
+    --conflict-resolve "${CONFLICT_RESOLVE}" \
+    --conflict-loser pathname \
+    --conflict-suffix conflict-local,conflict-remote \
+    --max-delete "${MAX_DELETE_PERCENT}" \
+    --recover \
+    --resilient \
+    --drive-skip-gdocs \
+    --create-empty-src-dirs \
+    --transfers "${TRANSFERS}" \
+    --checkers "${CHECKERS}" \
+    --log-file "${LOG}" \
+    --log-level INFO \
+    "${BACKUP[@]}" "${EXTRA[@]}" "${ARGS[@]}"
+STATUS=$?
+set -e
+
+PREVIOUS=$(read_failures)
+
+if [ ${STATUS} -eq 0 ]; then
+    log "===== DONE ====="
+
+    # The filter snapshot is saved only after a run that actually worked, and
+    # never after a dry run: saving it otherwise would compare the next change
+    # against a state rclone never accepted.
+    if [ "${DRY}" -eq 0 ]; then
+        cp -f "${REPOS_CURRENT}" "${REPOS_PREVIOUS}"
+        printf '%s\n' "${BASE_MD5_NOW}" >"${BASE_MD5}"
+    fi
+
+    if [ "${AUTO_RESYNC}" -eq 1 ]; then
+        notify normal "Sync exclusions updated" \
+            "New git repositories were detected and reconciled automatically. Nothing was deleted." \
+            emblem-default
+    fi
+
+    # If it had been failing long enough to alert, say that it recovered: an
+    # alarm with no all-clear trains people to ignore alarms.
+    if [ "${PREVIOUS}" -ge "${FAIL_THRESHOLD}" ]; then
+        notify normal "Sync is back" \
+            "Syncing recovered after ${PREVIOUS} failed attempts." \
+            emblem-default
+        log "Recovered after ${PREVIOUS} consecutive failures."
+    fi
+    echo 0 >"${FAILURES}"
+else
+    log "===== FAILED (exit=${STATUS}) ====="
+    log "If the state is out of step, reconcile with: $0 --resync"
+
+    if ! have_network; then
+        log "No network: not counted as a failure."
+    else
+        N=$(( PREVIOUS + 1 ))
+        echo "${N}" >"${FAILURES}"
+        log "Consecutive failure number ${N} (with network available)."
+
+        # Alert at the threshold, then once an hour, so it doesn't become
+        # noise that gets learned away.
+        if [ "${N}" -eq "${FAIL_THRESHOLD}" ] \
+           || { [ "${N}" -gt "${FAIL_THRESHOLD}" ] && [ $(( N % REMIND_EVERY )) -eq 0 ]; }; then
+            notify critical "Sync is not running" \
+                "${N} failed attempts in a row. Check: tail -40 ${LOG}" \
+                dialog-error
+        fi
+    fi
+fi
+
+exit ${STATUS}

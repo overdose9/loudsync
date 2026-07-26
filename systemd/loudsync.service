@@ -1,0 +1,15 @@
+[Unit]
+Description=loudsync — two-way sync of a local folder with an rclone remote
+Documentation=https://github.com/overdose9/loudsync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=@BINDIR@/loudsync
+# Low priority: syncing must never fight with whatever you are doing.
+Nice=10
+IOSchedulingClass=idle
+# Generous, because a first --resync over a large folder is slow. The script
+# takes a lock, so an overrun cannot stack runs on top of each other.
+TimeoutStartSec=30min

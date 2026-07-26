@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""
+Propagate local renames to the remote.
+
+rclone bisync does not understand renames: it sees N deletions on one side and
+N creations on the other. When the renamed folder also contains a git repo, the
+exclusion list changes and bisync stops entirely until someone reconciles by
+hand.
+
+The dangerous move there is running plain "--resync": it pulls the old-named
+folder back down from the remote and leaves you with both copies. This does the
+right thing first: renames on the remote server-side, so no data moves.
+
+It does NOT guess. Files are matched by MD5 and size, and only when the
+correspondence is exactly one to one. Anything that doesn't match is left
+alone and reported, for a human to deal with.
+
+Invoked by `loudsync --propagate-rename`. Not meant to be run directly.
+
+Copyright (C) 2026 Sebastián Flores
+Licensed under the GNU General Public License v3.0 or later.
+"""
+
+import csv
+import subprocess
+import sys
+from collections import defaultdict
+
+# Exit codes that the loudsync shell script interprets.
+OK = 0        # safe to continue with the --resync
+ERROR = 1
+CANCELLED = 2
+
+
+def lsf(rclone, path, filters, extra=()):
+    """Return {relative_path: (md5, size)} for one side."""
+    cmd = [rclone, "lsf", "-R", "--files-only", "--csv",
+           "--format", "hsp", "--filter-from", filters, *extra, path]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        sys.stderr.write(f"rclone lsf failed on {path}:\n{res.stderr}\n")
+        raise SystemExit(ERROR)
+    out = {}
+    for row in csv.reader(res.stdout.splitlines()):
+        if len(row) >= 3:
+            h, size, p = row[0], row[1], ",".join(row[2:])
+            out[p] = (h, size)
+    return out
+
+
+def common_suffix(a, b):
+    """How many trailing path components two paths share."""
+    pa, pb = a.split("/"), b.split("/")
+    n = 0
+    while n < min(len(pa), len(pb)) and pa[-1 - n] == pb[-1 - n]:
+        n += 1
+    return n
+
+
+def match_pairs(only_remote, only_local):
+    """Pairs of (remote_path, local_path) with identical content, one to one.
+
+    If the same (hash, size) shows up twice on either side we don't match it:
+    there is no way to tell which goes with which, and getting it wrong here
+    means moving the wrong file.
+    """
+    by_content_r = defaultdict(list)
+    by_content_l = defaultdict(list)
+    for p, k in only_remote.items():
+        by_content_r[k].append(p)
+    for p, k in only_local.items():
+        by_content_l[k].append(p)
+
+    pairs, ambiguous = [], []
+    for k, remote_paths in by_content_r.items():
+        local_paths = by_content_l.get(k, [])
+        if not local_paths:
+            continue
+        if len(remote_paths) == 1 and len(local_paths) == 1:
+            pairs.append((remote_paths[0], local_paths[0]))
+        else:
+            ambiguous.extend(remote_paths)
+    return pairs, ambiguous
+
+
+def folder_renames(pairs, remote_tree, local_tree):
+    """Collapse file pairs into folder renames where that holds.
+
+    Moving a whole folder is one server-side operation instead of N. Only
+    accepted when the folder's entire content on the remote is identical to the
+    local folder's: if anything is missing or extra, the rename came bundled
+    with other changes and we'd rather not group it.
+    """
+    candidates = defaultdict(int)
+    for r, l in pairs:
+        n = common_suffix(r, l)
+        if n == 0:
+            continue
+        pr, pl = "/".join(r.split("/")[:-n]), "/".join(l.split("/")[:-n])
+        if pr and pl and pr != pl:
+            candidates[(pr, pl)] += 1
+
+    def contents(tree, prefix):
+        return {p[len(prefix) + 1:] for p in tree if p.startswith(prefix + "/")}
+
+    accepted = []
+    # Most files first: if a parent folder already explains the rename, there
+    # is no need to move its children too.
+    for (pr, pl) in sorted(candidates, key=lambda c: -candidates[c]):
+        if any(pr == a or pr.startswith(a + "/") for a, _ in accepted):
+            continue
+        if contents(remote_tree, pr) != contents(local_tree, pl):
+            continue
+        if any(p == pl or p.startswith(pl + "/") for p in remote_tree):
+            continue  # destination already exists remotely: not a clean rename
+        accepted.append((pr, pl))
+    return accepted
+
+
+def move(rclone, remote, src, dst, is_folder):
+    cmd = [rclone, "moveto", f"{remote}/{src}", f"{remote}/{dst}"]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        kind = "folder" if is_folder else "file"
+        sys.stderr.write(f"  ERROR moving {kind} {src}:\n{res.stderr}\n")
+        return False
+    return True
+
+
+def main():
+    if len(sys.argv) < 5:
+        sys.stderr.write("usage: loudsync-rename RCLONE LOCAL_DIR REMOTE FILTERS [--yes]\n")
+        return ERROR
+    rclone, local_dir, remote, filters = sys.argv[1:5]
+    assume_yes = "--yes" in sys.argv[5:]
+
+    print("Comparing both sides (this hashes files, it can take a while)...")
+    remote_tree = lsf(rclone, remote, filters, extra=("--drive-skip-gdocs",))
+    local_tree = lsf(rclone, local_dir, filters)
+    print(f"  remote: {len(remote_tree)} files | local: {len(local_tree)} files")
+
+    only_remote = {p: k for p, k in remote_tree.items() if p not in local_tree}
+    only_local = {p: k for p, k in local_tree.items() if p not in remote_tree}
+
+    if not only_remote and not only_local:
+        print("\nNo name differences: both sides already match.")
+        return OK
+
+    pairs, ambiguous = match_pairs(only_remote, only_local)
+    folders = folder_renames(pairs, remote_tree, local_tree)
+
+    # Pairs already covered by a folder rename are not moved again one by one.
+    def covered(p):
+        return any(p == pr or p.startswith(pr + "/") for pr, _ in folders)
+
+    singles = [(r, l) for r, l in pairs if not covered(r)]
+    matched_r = {r for r, _ in pairs}
+    matched_l = {l for _, l in pairs}
+    unmatched_r = sorted(p for p in only_remote if p not in matched_r)
+    unmatched_l = sorted(p for p in only_local if p not in matched_l)
+
+    print("\n" + "=" * 70)
+    print("PLAN")
+    print("=" * 70)
+
+    if folders:
+        print(f"\nRename {len(folders)} folder(s) on the remote (server-side):")
+        for pr, pl in folders:
+            n = len([p for p in remote_tree if p.startswith(pr + "/")])
+            print(f"  {pr}\n    -> {pl}   ({n} file{'' if n == 1 else 's'})")
+    if singles:
+        print(f"\nRename {len(singles)} individual file(s) on the remote:")
+        for r, l in singles:
+            print(f"  {r}\n    -> {l}")
+    if not folders and not singles:
+        print("\nNo renames detected.")
+
+    if unmatched_r or unmatched_l:
+        print("\nUnmatched (NOT renames, left alone here):")
+        for p in unmatched_r:
+            print(f"  remote only: {p}")
+        for p in unmatched_l:
+            print(f"  local only:  {p}")
+        print("\n  The --resync that follows will settle these by date: newest")
+        print("  wins. If you deleted one of them on purpose, it may come back.")
+    if ambiguous:
+        print(f"\n{len(ambiguous)} file(s) have duplicate content: there is no way")
+        print("  to tell which maps to which, so they are deliberately skipped.")
+
+    if not folders and not singles:
+        if not unmatched_r and not unmatched_l:
+            print("\nNothing to propagate.")
+            return OK
+        # No renames, but real differences. Ask anyway: the --resync that
+        # follows resolves them by date, which can bring back something that
+        # was deleted on purpose.
+        print("\nNo renames to propagate, but there are unmatched differences.")
+
+    print()
+    if assume_yes:
+        print("Applying (--yes).")
+    else:
+        if not sys.stdin.isatty():
+            sys.stderr.write("A terminal is needed to confirm. Run this in a "
+                             "terminal window, or pass --yes.\n")
+            return ERROR
+        try:
+            if input("Apply on the remote? [y/N] ").strip().lower() not in ("y", "yes"):
+                print("Cancelled. Nothing was touched.")
+                return CANCELLED
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled. Nothing was touched.")
+            return CANCELLED
+
+    print()
+    failures = 0
+    for pr, pl in folders:
+        print(f"  folder: {pr} -> {pl}")
+        failures += not move(rclone, remote, pr, pl, True)
+    for r, l in singles:
+        print(f"  file: {r} -> {l}")
+        failures += not move(rclone, remote, r, l, False)
+
+    if failures:
+        sys.stderr.write(f"\n{failures} move(s) failed. Not continuing to the "
+                         "--resync: check the error above.\n")
+        return ERROR
+
+    print("\nRenames propagated. Reconciliation follows.")
+    return OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+#
+# Watches the local folder and triggers a sync a few seconds after any change.
+#
+# This is what makes uploads feel instant. Downloads still depend on the timer,
+# because most providers don't notify third-party clients about remote changes.
+#
+# Needs inotify-tools. Without it the timer alone still covers both directions,
+# just with more latency on the way up.
+#
+# Copyright (C) 2026 Sebastián Flores
+# Licensed under the GNU General Public License v3.0 or later.
+
+set -euo pipefail
+
+CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}/loudsync"
+CONFIG_FILE="${LOUDSYNC_CONFIG:-${CONFIG_HOME}/loudsync.conf}"
+
+LOCAL_DIR=""
+WATCH_DEBOUNCE=5   # seconds to group bursts (saving 20 files = one sync)
+SYNC_UNIT="loudsync.service"
+
+if [ -f "${CONFIG_FILE}" ]; then
+    # shellcheck source=/dev/null
+    . "${CONFIG_FILE}"
+else
+    echo "loudsync-watch: no config file at ${CONFIG_FILE}" >&2
+    exit 1
+fi
+
+LOCAL_DIR="${LOCAL_DIR/#\~/${HOME}}"
+[ -d "${LOCAL_DIR}" ] || { echo "loudsync-watch: no such folder: ${LOCAL_DIR}" >&2; exit 1; }
+
+command -v inotifywait >/dev/null 2>&1 || {
+    echo "inotifywait not found. Install inotify-tools." >&2
+    exit 1
+}
+
+# Noise not worth waking the sync for. These are the same paths the filters
+# exclude, so a change inside them would produce an empty run anyway.
+IGNORE='(/\.git/|/node_modules/|/\.venv/|/venv/|/__pycache__/|/dist/|/\.astro/|/\.pytest_cache/|/\.mypy_cache/|/\.ruff_cache/|\.swp$|\.tmp$|~$)'
+
+while true; do
+    # Blocks until something relevant happens.
+    inotifywait -r -q -e modify,create,delete,move \
+        --exclude "${IGNORE}" "${LOCAL_DIR}" >/dev/null 2>&1 || true
+
+    sleep "${WATCH_DEBOUNCE}"
+
+    # start, not restart: if a sync is already running, systemd queues this one
+    # instead of killing it halfway through.
+    systemctl --user start "${SYNC_UNIT}" || true
+done

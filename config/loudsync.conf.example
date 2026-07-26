@@ -1,0 +1,67 @@
+# loudsync configuration.
+#
+# Installed to ~/.config/loudsync/loudsync.conf
+# This file is sourced by bash, so it is plain KEY="value" lines.
+#
+# Only LOCAL_DIR and REMOTE are required.
+
+# --- Required ---------------------------------------------------------------
+
+# The local folder to keep in sync. A leading ~ is expanded.
+LOCAL_DIR="~/Documents"
+
+# The rclone remote and path, as "remote:path".
+# Create it first with: rclone config
+# The path does not need to exist yet.
+REMOTE="gdrive:LoudSync"
+
+# --- Optional ---------------------------------------------------------------
+
+# Path to the rclone binary. Leave empty to auto-detect (~/.local/bin, /usr/bin,
+# /usr/local/bin, then PATH). Worth setting explicitly if you have more than one.
+RCLONE_BIN=""
+
+# Extra exclusion rules you maintain by hand. The git repo exclusions are
+# generated separately and merged in on every run.
+# FILTERS_BASE="${HOME}/.config/loudsync/filters-base.txt"
+
+# Safety brake, as a PERCENTAGE of files (this is how bisync reads it, not as a
+# file count). If a run would delete more than this share of either side, it
+# aborts and tells you. 50 is rclone's own default.
+MAX_DELETE_PERCENT=50
+
+# What wins when the same file changed on both sides since the last run.
+# "newer" keeps the most recent and saves the loser next to it with a
+# .conflict-local / .conflict-remote suffix. Other values: "older", "larger",
+# "smaller", "path1", "path2", "none".
+CONFLICT_RESOLVE="newer"
+
+# Keep a local copy of files that were overwritten by a change coming down from
+# the remote, under ~/.local/state/loudsync/versions/<date>/.
+#
+# This covers the one case the remote's own history does not: the file that got
+# overwritten is your local one. Set to 0 to disable.
+KEEP_LOCAL_VERSIONS=1
+
+# How deep to look for .git directories. Raise it if your repos are nested
+# deeper than this; every level costs a little time on every run.
+MAX_REPO_DEPTH=8
+
+# Consecutive failures before the first desktop alert. With a one-minute timer,
+# 3 means "tell me after three minutes of failing", which filters out the blips.
+FAIL_THRESHOLD=3
+
+# After the threshold, remind once every N failures, so a persistent problem
+# doesn't turn into noise you learn to ignore. 60 = roughly once an hour.
+REMIND_EVERY=60
+
+# Seconds the watcher waits after a change before syncing, to group bursts.
+WATCH_DEBOUNCE=5
+
+# rclone parallelism. Lower these on a slow link or a low-powered machine.
+TRANSFERS=8
+CHECKERS=16
+
+# Set to 0 to disable desktop notifications entirely. Not recommended: the
+# whole point of this tool is that it tells you when it breaks.
+NOTIFY=1

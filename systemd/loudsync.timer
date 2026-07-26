@@ -1,0 +1,16 @@
+[Unit]
+Description=Check the remote for changes every minute
+Documentation=https://github.com/overdose9/loudsync
+
+[Timer]
+# Most providers don't notify third-party clients, so pulling changes down
+# means asking. One minute is the balance between latency and API quota.
+# Local changes don't wait for this: the watcher triggers them in seconds.
+OnBootSec=2min
+OnUnitInactiveSec=1min
+AccuracySec=10s
+# If the machine was off, sync on boot instead of waiting for the next slot.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
