@@ -29,7 +29,7 @@
 
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 # --- Configuration ----------------------------------------------------------
 #
@@ -196,12 +196,32 @@ REPO_COUNT=$(wc -l <"${REPOS_CURRENT}")
 #   Repos were only ADDED  ->  automatic --resync. This is safe: excluding a
 #     folder deletes nothing on the other side, it just stops being synced.
 #
-#   A repo left the list, or the base filter file was edited  ->  NOT
-#     automated. A path that disappears is usually a rename, and a blind
-#     --resync then pulls the old-named folder back down from the remote and
-#     leaves you with both. Use --propagate-rename for that.
+#   A repo LEFT the list, or the base filter file was edited  ->  reconcile
+#     automatically as well, but never blindly. A path that disappears is
+#     usually a rename, and a --resync run before the remote has been told
+#     about it pulls the old-named folder back down and leaves you with both
+#     copies. So the rename is propagated to the remote first (server-side, no
+#     data moves) and only then reconciled. That is loudsync-rename --auto.
+#
+#     This used to stop and wait for a human instead. That was the wrong
+#     trade. What the stop avoided is a nuisance: --resync unions both sides,
+#     so a file deleted on purpose since the last run can come back, which you
+#     can see and undo. What the stop cost is unbounded: a backup sitting dead
+#     until somebody happens to read a notification — the exact failure this
+#     tool was written to prevent.
+#     (Changed 27-07-2026, after a folder move stopped the sync for a case the
+#     helper could prove was a no-op.)
+#
+#     A human is still asked when the plan is too large to apply unattended,
+#     or when one side lists no files at all. See the caps in loudsync-rename.
 AUTO_RESYNC=0
 MANUAL_REASON=""
+RECONCILE_REASON=""
+RENAMES_APPLIED=0
+UNMATCHED_REMOTE=0
+UNMATCHED_LOCAL=0
+UNDO_FILE=""
+HELPER_STATUS=0
 BASE_MD5_NOW="$(md5sum "${FILTERS_BASE}" | cut -d' ' -f1)"
 BASE_MD5_PREV="$(cat "${BASE_MD5}" 2>/dev/null || true)"
 
@@ -220,49 +240,97 @@ for arg in "$@"; do
     esac
 done
 
+HELPER="$(dirname "$(readlink -f "$0")")/loudsync-rename"
+
+# Runs the helper unattended, folding everything it prints into the log — this
+# happens with nobody watching, so the log is the only record of what was done
+# and why. Sets HELPER_STATUS, RENAMES_APPLIED and UNDO_FILE.
+run_rename_helper() {
+    local output line
+    [ -f "${HELPER}" ] || die "missing helper: ${HELPER}"
+    set +e
+    output="$(python3 "${HELPER}" "${RCLONE_BIN}" "${LOCAL_DIR}" "${REMOTE}" \
+        "${FILTERS}" --state-dir "${STATE_HOME}" "$@" 2>&1)"
+    HELPER_STATUS=$?
+    set -e
+    while IFS= read -r line; do
+        if [ -n "${line}" ]; then log "  rename | ${line}"; fi
+    done <<<"${output}"
+    UNDO_FILE="$(printf '%s\n' "${output}" | sed -n 's/^LOUDSYNC-UNDO //p' | tail -1)"
+    RENAMES_APPLIED="$(summary_field "${output}" moves)"
+    UNMATCHED_REMOTE="$(summary_field "${output}" unmatched_remote)"
+    UNMATCHED_LOCAL="$(summary_field "${output}" unmatched_local)"
+}
+
+# Pulls one number out of the helper's LOUDSYNC-SUMMARY line, 0 if absent.
+summary_field() {
+    local value
+    value="$(printf '%s\n' "$1" \
+        | sed -n "s/^LOUDSYNC-SUMMARY .*$2=\([0-9]\{1,\}\).*/\1/p" | tail -1)"
+    printf '%s' "${value:-0}"
+}
+
 if [ "${WANTS_RESYNC}" -eq 0 ] && [ "${RENAME_MODE}" -eq 0 ] \
    && [ -s "${REPOS_PREVIOUS}" ] && [ -n "${BASE_MD5_PREV}" ]; then
     GONE="$(comm -23 "${REPOS_PREVIOUS}" "${REPOS_CURRENT}")"
     ADDED="$(comm -13 "${REPOS_PREVIOUS}" "${REPOS_CURRENT}")"
 
     if [ "${BASE_MD5_NOW}" != "${BASE_MD5_PREV}" ]; then
-        MANUAL_REASON="${FILTERS_BASE} was edited"
+        RECONCILE_REASON="${FILTERS_BASE} was edited"
     elif [ -n "${GONE}" ]; then
-        MANUAL_REASON="these repos left the list (renamed?): $(printf '%s' "${GONE}" | tr '\n' ' ')"
+        RECONCILE_REASON="these repos left the list (renamed?): $(printf '%s' "${GONE}" | tr '\n' ' ')"
     elif [ -n "${ADDED}" ]; then
         AUTO_RESYNC=1
         log "Newly excluded repos: $(printf '%s' "${ADDED}" | tr '\n' ' ')"
         log "Filters only grew, reconciling with an automatic --resync."
     fi
 
+    if [ -n "${RECONCILE_REASON}" ]; then
+        log "Filters changed in a way that needs reconciling: ${RECONCILE_REASON}"
+        if [ "${DRY}" -eq 1 ]; then
+            log "--dry-run: showing the plan, applying nothing."
+            run_rename_helper --auto --dry-run
+        else
+            run_rename_helper --auto
+            case ${HELPER_STATUS} in
+                0) AUTO_RESYNC=1
+                   log "Reconciled automatically (${RENAMES_APPLIED} rename(s) propagated)." ;;
+                3) MANUAL_REASON="${RECONCILE_REASON}"
+                   log "This one is not safe to apply unattended; see the plan above." ;;
+                *) # Usually an unreachable remote. Fall through without a
+                   # resync: bisync will fail on the filter hash, and the normal
+                   # failure path already knows not to cry about being offline.
+                   log "The rename helper failed (exit ${HELPER_STATUS}); not reconciling this run." ;;
+            esac
+        fi
+    fi
+
     # Alert as soon as it is detected rather than waiting for the failure
     # threshold: the generic message doesn't say what to do, and here we know.
     if [ -n "${MANUAL_REASON}" ]; then
-        log "ATTENTION: filters changed and this needs a human: ${MANUAL_REASON}"
-        log "Sync is stopped until it is resolved. In a terminal, run:"
+        log "ATTENTION: sync is stopped until a human decides: ${MANUAL_REASON}"
+        log "In a terminal, run:"
         log "    $0 --propagate-rename"
         log "It compares both sides, shows what it would rename on the remote,"
-        log "and applies it after you confirm. If nothing was renamed, it just"
-        log "reconciles."
+        log "and applies it after you confirm."
         if [ "$(read_failures)" -eq 0 ]; then
-            notify critical "Sync stopped: the filter list changed" \
-                "${MANUAL_REASON}. Nothing was deleted. To fix it, run in a terminal: loudsync --propagate-rename" \
+            notify critical "Sync stopped: this needs a decision" \
+                "The filter list changed and the plan is too large to apply on its own. Nothing was deleted. Run in a terminal: loudsync --propagate-rename" \
                 dialog-error
         fi
     fi
 fi
 
-# --- Rename propagation -----------------------------------------------------
+# --- Rename propagation, interactive ----------------------------------------
 #
-# For the case this script deliberately refuses to automate. Rename on the
-# remote first (server-side, no data transferred), reconcile second. The other
-# order leaves both copies of the folder.
+# The same helper, driven by a human. No output capture here: it prints the
+# plan and waits for an answer, so it needs the terminal.
 if [ "${RENAME_MODE}" -eq 1 ]; then
-    HELPER="$(dirname "$(readlink -f "$0")")/loudsync-rename"
     [ -f "${HELPER}" ] || die "missing helper: ${HELPER}"
     log "Running --propagate-rename."
     set +e
-    python3 "${HELPER}" "${RCLONE_BIN}" "${LOCAL_DIR}" "${REMOTE}" "${FILTERS}" "${YES_ARGS[@]}"
+    python3 "${HELPER}" "${RCLONE_BIN}" "${LOCAL_DIR}" "${REMOTE}" "${FILTERS}" \
+        --state-dir "${STATE_HOME}" "${YES_ARGS[@]}"
     HELPER_STATUS=$?
     set -e
     case ${HELPER_STATUS} in
@@ -337,9 +405,28 @@ if [ ${STATUS} -eq 0 ]; then
     fi
 
     if [ "${AUTO_RESYNC}" -eq 1 ]; then
-        notify normal "Sync exclusions updated" \
-            "New git repositories were detected and reconciled automatically. Nothing was deleted." \
-            emblem-default
+        NOTE_TITLE="Sync exclusions updated"
+        NOTE_BODY="The git repository exclusions changed and the sync reconciled itself. Nothing was deleted."
+
+        # A rename on the remote is a change you didn't make by hand, so say so
+        # and say how to take it back.
+        if [ "${RENAMES_APPLIED}" -gt 0 ]; then
+            NOTE_TITLE="Renames propagated, sync reconciled"
+            NOTE_BODY="${RENAMES_APPLIED} rename(s) applied on the remote so the sync could continue on its own. To reverse them: ${UNDO_FILE}"
+        fi
+
+        # A --resync unions both sides, so a file deleted on purpose since the
+        # last run can reappear. That is the one thing this path can do behind
+        # your back, so it gets counted out loud instead of living in the log.
+        UNMATCHED_TOTAL=$(( UNMATCHED_REMOTE + UNMATCHED_LOCAL ))
+        if [ "${UNMATCHED_TOTAL}" -gt 0 ]; then
+            NOTE_BODY="${NOTE_BODY} ${UNMATCHED_TOTAL} file(s) existed on only one side and were settled by date, so anything you deleted on purpose since the last run may be back. They are listed in ${LOG}"
+        fi
+
+        # A desktop notification is gone the moment you dismiss it. What it said
+        # about a remote this script changed on its own belongs in the log too.
+        log "Notified: ${NOTE_TITLE} — ${NOTE_BODY}"
+        notify normal "${NOTE_TITLE}" "${NOTE_BODY}" emblem-default
     fi
 
     # If it had been failing long enough to alert, say that it recovered: an

@@ -58,7 +58,7 @@ responsibility.
 
 ## Status
 
-**v0.1.0 — early.** Daily-driven by the author on Linux Mint against Google
+**v0.2.0 — early.** Daily-driven by the author on Linux Mint against Google
 Drive, roughly 800 files. It has not been tested at large scale, across many
 providers, or by anyone else yet.
 
@@ -163,20 +163,41 @@ N creations on the other. Usually that resolves fine on its own.
 But renaming a folder that *contains a git repo* changes the generated
 exclusion list, and bisync stores a hash of its filter file and aborts when it
 changes — a different filter could make it read an exclusion as a mass
-deletion. So the sync stops.
+deletion.
 
 Running `--resync` at that point is the wrong move: it pulls the old-named
 folder back down from the remote and leaves you holding both copies.
 
-`loudsync --propagate-rename` does it in the right order. It compares both
-sides, matches files by MD5 and size, and **only when the match is exactly one
-to one** does it treat the pair as a rename. It shows you the plan, waits for
-confirmation, renames on the remote server-side (no data transfer), and only
-then reconciles. Anything ambiguous is reported and left alone.
+So loudsync does it in the right order, by itself. It compares both sides,
+matches files by MD5 and size, and **only when the match is exactly one to
+one** does it treat the pair as a rename. It renames on the remote server-side
+(no data transfer), writes a script that reverses exactly what it did, and only
+then reconciles. Anything ambiguous is reported and left alone. You get a
+notification saying what moved and where the undo script is.
 
-New repos are handled automatically and need none of this: if the exclusion
-list only *grew*, loudsync reconciles by itself, because excluding a folder
-deletes nothing on the other side.
+It stops and asks for you in two cases: when the plan is larger than 50 moves,
+and when one side lists no files at all — that isn't a rename, it's a broken
+mount or an expired token. Then you run `loudsync --propagate-rename`, which is
+the same machinery with the plan printed and a confirmation prompt.
+
+This used to always stop and wait for a human. That was the wrong trade. What
+the stop avoided is a nuisance: `--resync` unions both sides, so a file you
+deleted on purpose since the last run can come back. That now gets counted in
+the notification, so it can't pass unnoticed. What the stop cost is unbounded:
+a backup sitting dead until somebody happens to read a notification, which is
+the exact failure this tool exists to prevent.
+
+Note the limitation this buys. loudsync follows your local folder. If a rename
+was a mistake — yours, or another tool's — it reaches the remote within
+seconds, and the remote will match the mistake. The undo script reverses it
+exactly and the notification says where it is, but nothing here second-guesses
+the move itself. What you do on your own machine and your own remote is your
+responsibility; this tool makes the two agree, it doesn't judge which one is
+right.
+
+New repos need none of this: if the exclusion list only *grew*, loudsync
+reconciles without even comparing, because excluding a folder deletes nothing
+on the other side.
 
 ## What it deliberately does not do
 
@@ -184,16 +205,18 @@ deletes nothing on the other side.
 - **No one-way / backup-only mode.** It's a two-way sync.
 - **No remote-side versioning.** Your provider already does that; duplicating
   it burns quota and grows a dated folder nobody prunes.
-- **No automatic resync when a path disappears.** That needs a human, and
-  pretending otherwise is how people end up with duplicated folders.
+- **No blind resync when a path disappears.** The rename gets propagated to the
+  remote first, or you end up with duplicated folders.
 - **No content scanning for secrets.** Filenames only. See the honest
   limitation above.
 
 ## Troubleshooting
 
-**"the sync stopped and told me the filter list changed"** — you renamed or
-moved a folder containing a repo. Run `loudsync --propagate-rename` in a
-terminal.
+**"the sync stopped and needs a decision"** — you renamed or moved a folder
+containing a repo, and the resulting plan was too large to apply unattended (or
+one side listed nothing at all). Run `loudsync --propagate-rename` in a
+terminal to see the plan and approve it. Smaller renames are handled without
+you; the log shows what was moved.
 
 **Nothing is being uploaded within seconds** — the watcher likely isn't
 running, or `inotify-tools` isn't installed. Check with

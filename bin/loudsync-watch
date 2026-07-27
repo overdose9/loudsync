@@ -38,7 +38,7 @@ command -v inotifywait >/dev/null 2>&1 || {
 
 # Noise not worth waking the sync for. These are the same paths the filters
 # exclude, so a change inside them would produce an empty run anyway.
-IGNORE='(/\.git/|/node_modules/|/\.venv/|/venv/|/__pycache__/|/dist/|/\.astro/|/\.pytest_cache/|/\.mypy_cache/|/\.ruff_cache/|\.swp$|\.tmp$|~$)'
+IGNORE='(/\.git/|/\.claude/|/node_modules/|/\.venv/|/venv/|/__pycache__/|/dist/|/\.astro/|/\.pytest_cache/|/\.mypy_cache/|/\.ruff_cache/|\.swp$|\.tmp$|~$)'
 
 while true; do
     # Blocks until something relevant happens.

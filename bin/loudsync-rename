@@ -13,23 +13,54 @@ right thing first: renames on the remote server-side, so no data moves.
 
 It does NOT guess. Files are matched by MD5 and size, and only when the
 correspondence is exactly one to one. Anything that doesn't match is left
-alone and reported, for a human to deal with.
+alone and reported.
 
-Invoked by `loudsync --propagate-rename`. Not meant to be run directly.
+Two modes:
+
+  interactive  shows the plan and asks before touching the remote.
+               `loudsync --propagate-rename`
+
+  --auto       applies the plan without asking, as long as it stays inside the
+               caps below, and writes an undo script. This is what loudsync
+               runs by itself when the filter list changes, so that a rename
+               doesn't leave the backup stopped until somebody reads a
+               notification.
+
+Invoked by loudsync. Not meant to be run directly.
 
 Copyright (C) 2026 Sebastián Flores
 Licensed under the GNU General Public License v3.0 or later.
 """
 
 import csv
+import os
+import shlex
 import subprocess
 import sys
 from collections import defaultdict
+from datetime import datetime
 
 # Exit codes that the loudsync shell script interprets.
-OK = 0        # safe to continue with the --resync
-ERROR = 1
-CANCELLED = 2
+OK = 0           # safe to continue with the --resync
+ERROR = 1        # rclone failed, the network is down, or a move failed
+CANCELLED = 2    # the user said no
+NEEDS_HUMAN = 3  # the plan is real but too risky to apply unattended
+
+# Brakes for --auto. Above these it stops and asks, in the same spirit as
+# bisync's --max-delete: renaming a folder moves a handful of things, and an
+# unattended run that wants to move far more is likelier to be a mistake than
+# a refactor.
+AUTO_MAX_MOVES = 50
+
+
+def emit_summary(folders=0, files=0, unmatched_remote=0, unmatched_local=0,
+                 ambiguous=0, moves=0, undo=""):
+    """One machine-readable line for the shell script to act on."""
+    print(f"LOUDSYNC-SUMMARY folders={folders} files={files} "
+          f"unmatched_remote={unmatched_remote} unmatched_local={unmatched_local} "
+          f"ambiguous={ambiguous} moves={moves}")
+    if undo:
+        print(f"LOUDSYNC-UNDO {undo}")
 
 
 def lsf(rclone, path, filters, extra=()):
@@ -63,13 +94,20 @@ def match_pairs(only_remote, only_local):
     If the same (hash, size) shows up twice on either side we don't match it:
     there is no way to tell which goes with which, and getting it wrong here
     means moving the wrong file.
+
+    Empty files are never matched. Every empty file has the same hash, so two
+    unrelated ones on opposite sides look exactly like a rename, and with
+    --auto nobody is reading the plan. Losing the match costs a duplicated
+    empty file; getting it wrong moves a real one.
     """
     by_content_r = defaultdict(list)
     by_content_l = defaultdict(list)
-    for p, k in only_remote.items():
-        by_content_r[k].append(p)
-    for p, k in only_local.items():
-        by_content_l[k].append(p)
+    for p, (h, size) in only_remote.items():
+        if size != "0":
+            by_content_r[(h, size)].append(p)
+    for p, (h, size) in only_local.items():
+        if size != "0":
+            by_content_l[(h, size)].append(p)
 
     pairs, ambiguous = [], []
     for k, remote_paths in by_content_r.items():
@@ -127,23 +165,78 @@ def move(rclone, remote, src, dst, is_folder):
     return True
 
 
+def open_undo(state_dir):
+    """A script that reverses whatever we are about to do. Returns (file, path).
+
+    Written before the first move and flushed after each one, so that a run
+    that dies halfway still leaves a usable record of what it did.
+    """
+    if not state_dir:
+        return None, ""
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(state_dir, f"undo-renames-{stamp}.sh")
+    f = open(path, "w")
+    f.write("#!/usr/bin/env bash\n"
+            "#\n"
+            "# Undoes the renames loudsync propagated to the remote on "
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.\n"
+            "# Run it only if those renames were wrong. Safe to delete.\n"
+            "#\n"
+            "set -euo pipefail\n\n")
+    f.flush()
+    os.chmod(path, 0o700)
+    return f, path
+
+
+def record_undo(undo_file, rclone, remote, src, dst):
+    """Append the inverse of a move that already succeeded."""
+    if undo_file is None:
+        return
+    undo_file.write("{} moveto {} {}\n".format(
+        shlex.quote(rclone),
+        shlex.quote(f"{remote}/{dst}"),
+        shlex.quote(f"{remote}/{src}")))
+    undo_file.flush()
+
+
 def main():
     if len(sys.argv) < 5:
-        sys.stderr.write("usage: loudsync-rename RCLONE LOCAL_DIR REMOTE FILTERS [--yes]\n")
+        sys.stderr.write("usage: loudsync-rename RCLONE LOCAL_DIR REMOTE FILTERS "
+                         "[--yes] [--auto] [--dry-run] [--state-dir DIR]\n")
         return ERROR
     rclone, local_dir, remote, filters = sys.argv[1:5]
-    assume_yes = "--yes" in sys.argv[5:]
+    flags = sys.argv[5:]
+    assume_yes = "--yes" in flags
+    auto = "--auto" in flags
+    dry_run = "--dry-run" in flags
+    state_dir = ""
+    if "--state-dir" in flags:
+        i = flags.index("--state-dir")
+        if i + 1 < len(flags):
+            state_dir = flags[i + 1]
 
     print("Comparing both sides (this hashes files, it can take a while)...")
     remote_tree = lsf(rclone, remote, filters, extra=("--drive-skip-gdocs",))
     local_tree = lsf(rclone, local_dir, filters)
     print(f"  remote: {len(remote_tree)} files | local: {len(local_tree)} files")
 
+    # One side listing nothing while the other is full is not a rename. It is a
+    # wrong remote path, an expired token or a folder that failed to mount, and
+    # reconciling through it unattended would copy an entire tree in the wrong
+    # direction.
+    if auto and bool(remote_tree) != bool(local_tree):
+        print("\nOne side lists no files at all and the other does. That is not a"
+              " rename — check the remote path and the rclone credentials.")
+        emit_summary(unmatched_remote=len(remote_tree),
+                     unmatched_local=len(local_tree))
+        return NEEDS_HUMAN
+
     only_remote = {p: k for p, k in remote_tree.items() if p not in local_tree}
     only_local = {p: k for p, k in local_tree.items() if p not in remote_tree}
 
     if not only_remote and not only_local:
         print("\nNo name differences: both sides already match.")
+        emit_summary()
         return OK
 
     pairs, ambiguous = match_pairs(only_remote, only_local)
@@ -187,46 +280,98 @@ def main():
         print(f"\n{len(ambiguous)} file(s) have duplicate content: there is no way")
         print("  to tell which maps to which, so they are deliberately skipped.")
 
-    if not folders and not singles:
+    moves = len(folders) + len(singles)
+    counts = dict(folders=len(folders), files=len(singles),
+                  unmatched_remote=len(unmatched_r),
+                  unmatched_local=len(unmatched_l),
+                  ambiguous=len(ambiguous))
+
+    if dry_run:
+        print("\n--dry-run: nothing was applied.")
+        emit_summary(**counts)
+        return OK
+
+    if auto:
+        # Unmatched files deliberately do NOT stop the automatic path. They are
+        # the normal state of a folder somebody is working in — anything
+        # created since the last sync is unmatched — so blocking on them would
+        # mean the automatic path almost never runs. What they can cost is a
+        # file deleted on purpose since the last run coming back, because
+        # --resync unions both sides. That is a nuisance you can see and undo;
+        # a backup left stopped until someone reads a notification is not.
+        if moves > AUTO_MAX_MOVES:
+            print(f"\n{moves} moves is more than the {AUTO_MAX_MOVES} this will "
+                  "apply unattended. Stopping so a human can look at the plan.")
+            emit_summary(**counts)
+            return NEEDS_HUMAN
+        if moves == 0:
+            print("\nNo renames to propagate. The --resync that follows is enough.")
+            emit_summary(**counts)
+            return OK
+        print(f"\nApplying {moves} move(s) automatically.")
+    elif not folders and not singles:
         if not unmatched_r and not unmatched_l:
             print("\nNothing to propagate.")
+            emit_summary(**counts)
             return OK
         # No renames, but real differences. Ask anyway: the --resync that
         # follows resolves them by date, which can bring back something that
         # was deleted on purpose.
         print("\nNo renames to propagate, but there are unmatched differences.")
 
-    print()
-    if assume_yes:
-        print("Applying (--yes).")
-    else:
-        if not sys.stdin.isatty():
+    if not auto:
+        print()
+        if assume_yes:
+            print("Applying (--yes).")
+        elif not sys.stdin.isatty():
             sys.stderr.write("A terminal is needed to confirm. Run this in a "
                              "terminal window, or pass --yes.\n")
             return ERROR
-        try:
-            if input("Apply on the remote? [y/N] ").strip().lower() not in ("y", "yes"):
-                print("Cancelled. Nothing was touched.")
+        else:
+            try:
+                if input("Apply on the remote? [y/N] ").strip().lower() not in ("y", "yes"):
+                    print("Cancelled. Nothing was touched.")
+                    return CANCELLED
+            except (EOFError, KeyboardInterrupt):
+                print("\nCancelled. Nothing was touched.")
                 return CANCELLED
-        except (EOFError, KeyboardInterrupt):
-            print("\nCancelled. Nothing was touched.")
-            return CANCELLED
 
     print()
+    undo_file, undo_path = open_undo(state_dir)
+    applied = 0
     failures = 0
-    for pr, pl in folders:
-        print(f"  folder: {pr} -> {pl}")
-        failures += not move(rclone, remote, pr, pl, True)
-    for r, l in singles:
-        print(f"  file: {r} -> {l}")
-        failures += not move(rclone, remote, r, l, False)
+    try:
+        for pr, pl in folders:
+            print(f"  folder: {pr} -> {pl}")
+            if move(rclone, remote, pr, pl, True):
+                record_undo(undo_file, rclone, remote, pr, pl)
+                applied += 1
+            else:
+                failures += 1
+        for r, l in singles:
+            print(f"  file: {r} -> {l}")
+            if move(rclone, remote, r, l, False):
+                record_undo(undo_file, rclone, remote, r, l)
+                applied += 1
+            else:
+                failures += 1
+    finally:
+        if undo_file is not None:
+            undo_file.close()
+            if applied == 0:
+                os.unlink(undo_path)
+                undo_path = ""
 
     if failures:
         sys.stderr.write(f"\n{failures} move(s) failed. Not continuing to the "
                          "--resync: check the error above.\n")
+        emit_summary(**counts, moves=applied, undo=undo_path)
         return ERROR
 
     print("\nRenames propagated. Reconciliation follows.")
+    if undo_path:
+        print(f"To reverse them: {undo_path}")
+    emit_summary(**counts, moves=applied, undo=undo_path)
     return OK
 
 
