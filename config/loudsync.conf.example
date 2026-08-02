@@ -36,6 +36,28 @@ MAX_DELETE_PERCENT=50
 # "smaller", "path1", "path2", "none".
 CONFLICT_RESOLVE="newer"
 
+# Don't start a sync while a file was written less than this many seconds ago.
+#
+# Saving a file while a run is in flight is how you get a conflict with nobody
+# on the other end: the run records in its listing the version it saw, uploads
+# the version it read a moment later, and on the next pass both sides look
+# changed. Waiting for the folder to go quiet removes the common case.
+#
+# Set to 0 to disable. Excluded directories (git repos, node_modules, caches)
+# don't count as activity.
+QUIET_SECONDS=15
+
+# ...but never postpone more than this many runs in a row. Something writing
+# constantly into the folder must not be able to stop backups indefinitely:
+# after this many, the run goes ahead and says so in the log.
+MAX_QUIET_SKIPS=5
+
+# Below this gap between the two versions, a conflict is reported as what it
+# almost always is — one file saved while a sync was running — instead of
+# raising a critical alert. Above it, it's treated as a real divergence and
+# alerts. Conflicts are always logged either way.
+CONFLICT_RACE_SECONDS=120
+
 # Keep a local copy of files that were overwritten by a change coming down from
 # the remote, under ~/.local/state/loudsync/versions/<date>/.
 #

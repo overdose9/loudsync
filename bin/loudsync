@@ -13,13 +13,15 @@
 #      incident. See the shipped filter file.
 #
 #   3. It is loud. A backup that fails silently is worse than no backup,
-#      because it buys you confidence you haven't earned.
+#      because it buys you confidence you haven't earned. That includes
+#      conflicts: rclone resolves them, exits 0, and tells nobody.
 #
 # Usage:
 #   loudsync                    normal run (this is what systemd calls)
 #   loudsync --resync           first run, or to rebuild sync state
 #   loudsync --dry-run          show what would happen, change nothing
 #   loudsync --propagate-rename you renamed a folder containing a git repo
+#   loudsync --now              sync even if the folder is being written to
 #   loudsync --status           show current state and exit
 #
 # Any other flag is passed straight through to `rclone bisync`.
@@ -29,7 +31,7 @@
 
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 
 # --- Configuration ----------------------------------------------------------
 #
@@ -50,6 +52,9 @@ KEEP_LOCAL_VERSIONS=1   # keep a copy of local files overwritten from the remote
 MAX_REPO_DEPTH=8        # how deep to look for .git directories
 FAIL_THRESHOLD=3        # consecutive failures before the first alert
 REMIND_EVERY=60         # after that, remind once every N failures
+QUIET_SECONDS=15        # don't start while a file was written this recently
+MAX_QUIET_SKIPS=5       # ...but never postpone more runs than this in a row
+CONFLICT_RACE_SECONDS=120  # conflicts closer together than this look like a race
 TRANSFERS=8
 CHECKERS=16
 NOTIFY=1
@@ -86,6 +91,15 @@ REPOS_CURRENT="${STATE_HOME}/repos-current.txt"
 REPOS_PREVIOUS="${STATE_HOME}/repos-previous.txt"
 BASE_MD5="${STATE_HOME}/filters-base.md5"
 
+# How many runs in a row were postponed because the folder was being written to.
+QUIET_SKIPS="${STATE_HOME}/quiet-skips"
+
+# Files that were still being written while the previous run was uploading
+# them. Kept because they are the evidence that a conflict on the NEXT run is
+# this machine racing itself rather than an edit from somewhere else.
+RACED="${STATE_HOME}/raced-files.txt"
+RACE_SCAN_LIMIT=500     # how many transferred files to check for mid-run edits
+
 TODAY="$(date +%Y-%m-%d)"
 # Versioned copies of local files that were overwritten by the remote.
 #
@@ -121,6 +135,37 @@ notify() {
 # Being offline is normal on a laptop and is not a failure worth alerting on.
 have_network() { ping -c1 -W2 8.8.8.8 >/dev/null 2>&1; }
 
+# True if any file that would be synced was written in the last QUIET_SECONDS.
+#
+# Syncing a folder somebody is typing into is how you manufacture conflicts out
+# of nothing: bisync records in its listing the version it SAW while building
+# the listing, but uploads the version it READS seconds later. When those two
+# differ, the remote no longer matches the listing, so on the next run BOTH
+# sides look changed and a file that only ever existed on one machine gets
+# resolved as a conflict against itself.
+#
+# Directories are pruned by name rather than from the filter file: the point is
+# to spot a human editing a document, and a build directory or a repo churning
+# in the background would otherwise postpone every run forever.
+HOT_FILE=""
+folder_is_hot() {
+    local ref hit
+    ref="${STATE_HOME}/quiet-reference"
+    # A reference file instead of find's relative-date syntax, which is a GNU
+    # extension. -newer is in every find there is.
+    if ! touch -d "@$(( $(date +%s) - QUIET_SECONDS ))" "${ref}" 2>/dev/null; then
+        log "Could not build the quiet-check reference file; syncing without that check."
+        return 1
+    fi
+    hit="$( cd "${LOCAL_DIR}" && find . \
+        \( -name .git -o -name node_modules -o -name .venv -o -name venv \
+           -o -name __pycache__ -o -name .mypy_cache -o -name .pytest_cache \
+           -o -name .ruff_cache -o -name .cache -o -name .claude \) -prune \
+        -o -type f -newer "${ref}" -print -quit 2>/dev/null )"
+    HOT_FILE="${hit#./}"
+    [ -n "${hit}" ]
+}
+
 die() { log "ERROR: $*"; echo "loudsync: $*" >&2; exit 1; }
 
 # --- Preflight --------------------------------------------------------------
@@ -149,8 +194,24 @@ if [ "${1:-}" = "--status" ]; then
     if [ -s "${REPOS_PREVIOUS}" ]; then
         echo "  excluded git repos: $(wc -l <"${REPOS_PREVIOUS}")"
     fi
+    SKIPPED="$(cat "${QUIET_SKIPS}" 2>/dev/null || echo 0)"
+    if [ "${SKIPPED}" -gt 0 ]; then
+        echo "  postponed: ${SKIPPED} run(s) in a row, the folder is being written to"
+    fi
     if [ -f "${LOG}" ]; then
         echo "  last run: $(grep -E '===== (DONE|FAILED)' "${LOG}" | tail -1 || echo 'never')"
+        echo "  last conflict: $(grep -E '===== CONFLICT' "${LOG}" | tail -1 || echo 'none recorded')"
+    fi
+
+    # Conflict copies pile up silently and every one of them is a decision
+    # somebody still owes the tool. Surfacing them is the whole point.
+    PENDING="$( cd "${LOCAL_DIR}" && find . \
+        \( -name .git -o -name node_modules \) -prune \
+        -o -type f \( -name '*.conflict-local' -o -name '*.conflict-remote' \) -print 2>/dev/null )"
+    if [ -n "${PENDING}" ]; then
+        echo "  unresolved conflict copies: $(printf '%s\n' "${PENDING}" | wc -l)"
+        printf '%s\n' "${PENDING}" | sed 's|^\./|    |' | head -10
+        echo "    (compare each with the file next to it, then delete the one you don't want)"
     fi
     exit 0
 fi
@@ -166,6 +227,49 @@ if ! flock -n 9; then
     log "A sync is already running; skipping this one."
     exit 0
 fi
+
+DRY=0
+WANTS_RESYNC=0
+RENAME_MODE=0
+FORCE_NOW=0
+YES_ARGS=()
+ARGS=()
+for arg in "$@"; do
+    case "${arg}" in
+        --dry-run|-n)       DRY=1;         ARGS+=("${arg}") ;;
+        --resync)           WANTS_RESYNC=1; ARGS+=("${arg}") ;;
+        --propagate-rename) RENAME_MODE=1 ;;
+        --now)              FORCE_NOW=1 ;;
+        --yes|-y)           YES_ARGS=(--yes) ;;
+        *)                                 ARGS+=("${arg}") ;;
+    esac
+done
+
+# --- Don't sync a folder that is being written to ---------------------------
+#
+# Postponing a run costs a minute of latency. Starting one mid-edit costs a
+# conflict against yourself, a renamed copy on the remote, and a file on your
+# disk that looks like somebody else edited it. The trade is not close.
+#
+# It is a reduction, not a cure: a save landing after the run starts still
+# races. What it removes is the common case, which is the run that starts
+# *while* you are typing.
+#
+# The cap matters as much as the check. A folder with something permanently
+# writing into it must never be able to postpone backups forever, so after
+# MAX_QUIET_SKIPS the run goes ahead and says why.
+QUIET_SKIPPED="$(cat "${QUIET_SKIPS}" 2>/dev/null || echo 0)"
+if [ "${QUIET_SECONDS}" -gt 0 ] && [ "${DRY}" -eq 0 ] && [ "${WANTS_RESYNC}" -eq 0 ] \
+   && [ "${RENAME_MODE}" -eq 0 ] && [ "${FORCE_NOW}" -eq 0 ] && folder_is_hot; then
+    if [ "${QUIET_SKIPPED}" -lt "${MAX_QUIET_SKIPS}" ]; then
+        QUIET_SKIPPED=$(( QUIET_SKIPPED + 1 ))
+        echo "${QUIET_SKIPPED}" >"${QUIET_SKIPS}"
+        log "Still being written to (${HOT_FILE}); postponing this run (${QUIET_SKIPPED}/${MAX_QUIET_SKIPS})."
+        exit 0
+    fi
+    log "The folder has been busy for ${MAX_QUIET_SKIPS} runs in a row (${HOT_FILE}); syncing anyway."
+fi
+echo 0 >"${QUIET_SKIPS}"
 
 # --- Filters: git repos discovered on every run -----------------------------
 
@@ -224,21 +328,6 @@ UNDO_FILE=""
 HELPER_STATUS=0
 BASE_MD5_NOW="$(md5sum "${FILTERS_BASE}" | cut -d' ' -f1)"
 BASE_MD5_PREV="$(cat "${BASE_MD5}" 2>/dev/null || true)"
-
-DRY=0
-WANTS_RESYNC=0
-RENAME_MODE=0
-YES_ARGS=()
-ARGS=()
-for arg in "$@"; do
-    case "${arg}" in
-        --dry-run|-n)       DRY=1;         ARGS+=("${arg}") ;;
-        --resync)           WANTS_RESYNC=1; ARGS+=("${arg}") ;;
-        --propagate-rename) RENAME_MODE=1 ;;
-        --yes|-y)           YES_ARGS=(--yes) ;;
-        *)                                 ARGS+=("${arg}") ;;
-    esac
-done
 
 HELPER="$(dirname "$(readlink -f "$0")")/loudsync-rename"
 
@@ -368,9 +457,208 @@ if [ "${WANTS_RESYNC}" -eq 1 ] || [ "${AUTO_RESYNC}" -eq 1 ]; then
     fi
 fi
 
+# --- Conflicts --------------------------------------------------------------
+#
+# rclone handles a conflict competently and then says nothing you will ever
+# see: it renames the loser, copies it across, logs at INFO and exits 0. The
+# run reads as a success, and the first you hear of it is a file with a strange
+# suffix sitting in your folder days later, next to a copy of your document
+# that is missing the last thing you wrote.
+#
+# That is precisely the event this tool exists to shout about. A conflict is
+# the one moment where two versions of your work are both real and only a human
+# can say which one counts.
+
+# Everything rclone logged during this run. The offset is taken before the run
+# because rclone appends to the same file this script writes to.
+run_log_slice() {
+    tail -c "+$(( LOG_OFFSET + 1 ))" "${LOG}" 2>/dev/null || true
+}
+
+# rclone prints the gap between two versions as a Go duration, and the unit
+# changes with the size of the gap: "16.934994885s", "1m30s", "8h0m0s",
+# "500ms". Reading the leading number and assuming seconds is how you file an
+# eight-hour divergence as a two-second race — which is the one mistake here
+# that points the wrong way. Prints whole seconds, or nothing if it can't tell.
+duration_seconds() {
+    printf '%s' "$1" | awk '
+    BEGIN { u["h"]=3600; u["m"]=60; u["s"]=1
+            u["ms"]=0.001; u["us"]=0.000001; u["µs"]=0.000001; u["ns"]=1e-9 }
+    {
+        s = $0; sub(/^-/, "", s); total = 0; ok = 0
+        while (length(s) > 0) {
+            if (!match(s, /^[0-9]+(\.[0-9]+)?/)) { ok = 0; break }
+            num = substr(s, 1, RLENGTH) + 0
+            s = substr(s, RLENGTH + 1)
+            if (!match(s, /^(ms|ns|us|µs|h|m|s)/)) { ok = 0; break }
+            unit = substr(s, 1, RLENGTH)
+            s = substr(s, RLENGTH + 1)
+            total += num * u[unit]
+            ok = 1
+        }
+        if (ok) printf "%d", total
+    }'
+}
+
+# A gap a person can read at a glance. The exact nanoseconds rclone reports
+# tell you nothing that "16s" or "8h" does not.
+human_gap() {
+    local s="$1"
+    if   [ "${s}" -eq 0 ];       then printf 'under a second'
+    elif [ "${s}" -lt 60 ];      then printf '%ss' "${s}"
+    elif [ "${s}" -lt 3600 ];    then printf '%sm' "$(( s / 60 ))"
+    elif [ "${s}" -lt 86400 ];   then printf '%sh' "$(( s / 3600 ))"
+    else                              printf '%sd' "$(( s / 86400 ))"
+    fi
+}
+
+# The paths rclone uploaded that were written again while it was uploading
+# them. Their entry in bisync's listing is now stale on both sides, which is
+# exactly what makes the NEXT run see a change on a side nobody touched.
+detect_raced_files() {
+    local slice="$1" started="$2" copied path mtime count=0 out=""
+    copied="$(printf '%s\n' "${slice}" \
+        | sed -n 's/^.*INFO  : \(.*\): Copied (.*)$/\1/p' | sort -u)"
+    [ -n "${copied}" ] || { : >"${RACED}"; return 0; }
+    while IFS= read -r path; do
+        [ -n "${path}" ] || continue
+        count=$(( count + 1 ))
+        if [ "${count}" -gt "${RACE_SCAN_LIMIT}" ]; then
+            log "Over ${RACE_SCAN_LIMIT} files transferred; only the first ${RACE_SCAN_LIMIT} were checked for mid-run edits."
+            break
+        fi
+        mtime="$(stat -c %Y "${LOCAL_DIR}/${path}" 2>/dev/null || echo 0)"
+        if [ "${mtime}" -gt "${started}" ]; then
+            out="${out}${path}"$'\n'
+            log "Written to while it was being uploaded: ${path}"
+            log "  Its next comparison will look like a change on both sides. It isn't one."
+        fi
+    done <<<"${copied}"
+    printf '%s' "${out}" >"${RACED}"
+}
+
+# Reads the run's log and turns every conflict into something a human can act
+# on: which file, which side won, by how much, where the other version is, and
+# whether this was two people working or one machine racing itself.
+report_conflicts() {
+    local slice="$1" was_raced="$2"
+    local paths path line winner diff loser sep rest
+    local diff_show diff_whole
+    local total=0 genuine=0 first="" body=""
+    declare -A WINNER_OF DIFF_OF
+
+    paths="$(printf '%s\n' "${slice}" \
+        | sed -n 's/^.*NOTICE: - WARNING  *New or changed in both paths  *- \(.*\)$/\1/p' | sort -u)"
+    [ -n "${paths}" ] || return 0
+
+    while IFS= read -r line; do
+        case "${line}" in
+            *": The winner is: Path"*)
+                winner="${line##*: The winner is: }"
+                rest="${line%: The winner is: *}"
+                WINNER_OF["${rest#*INFO  : }"]="${winner}"
+                ;;
+            *", Difference: "*)
+                sep=""
+                case "${line}" in
+                    *": Path1 is newer. "*) sep=": Path1 is newer. " ;;
+                    *": Path2 is newer. "*) sep=": Path2 is newer. " ;;
+                esac
+                [ -n "${sep}" ] || continue
+                # Kept whole. The trailing letter is the unit of a Go duration,
+                # not a marker to strip: "8h0m0s" without its last character is
+                # a different number, and "2h" doesn't end in s at all.
+                diff="${line##*, Difference: }"
+                rest="${line%%"${sep}"*}"
+                DIFF_OF["${rest#*INFO  : }"]="${diff}"
+                ;;
+        esac
+    done <<<"${slice}"
+
+    log "===== CONFLICT ====="
+    while IFS= read -r path; do
+        [ -n "${path}" ] || continue
+        total=$(( total + 1 ))
+        winner="${WINNER_OF[${path}]:-}"
+        diff="${DIFF_OF[${path}]:-}"
+
+        # --conflict-suffix is local,remote in that order, so the losing copy
+        # carries the suffix of the side it came from. Both sides end up with
+        # both files, so the path below is one you can open right now.
+        case "${winner}" in
+            Path1) loser="${path}.conflict-remote" ;;
+            Path2) loser="${path}.conflict-local"  ;;
+            *)     loser="" ;;
+        esac
+
+        log "Changed on both sides since the last run: ${path}"
+
+        diff_show=""
+        diff_whole=""
+        if [ -n "${diff}" ]; then
+            diff_whole="$(duration_seconds "${diff}")"
+            if [ -n "${diff_whole}" ]; then
+                diff_show="$(human_gap "${diff_whole}")"
+            else
+                # Unreadable: say so, show it verbatim, and let the file fall
+                # through to being treated as a real divergence. Guessing in the
+                # quiet direction is how a conflict goes unnoticed.
+                diff_show="${diff}"
+                log "  (could not read the time gap rclone reported: ${diff})"
+            fi
+        fi
+
+        case "${winner}" in
+            Path1) log "  Your local copy won${diff_show:+ by ${diff_show}} and was uploaded." ;;
+            Path2) log "  The remote copy won${diff_show:+ by ${diff_show}} and replaced your local file." ;;
+            *)     log "  No winner was chosen; both versions were kept." ;;
+        esac
+        if [ -n "${loser}" ]; then
+            log "  The other version is kept as: ${LOCAL_DIR}/${loser}"
+        fi
+
+        # Two versions seconds apart are almost never two people working. They
+        # are one file that was saved while a run was in flight — which this
+        # tool can often prove, because it watched it happen last run.
+        if printf '%s\n' "${was_raced}" | grep -qxF -- "${path}"; then
+            log "  This file was written to while the previous run was uploading it, so"
+            log "  this is not an edit from another machine — it is the same file racing itself."
+        elif [ -n "${diff_whole}" ] && [ "${diff_whole}" -lt "${CONFLICT_RACE_SECONDS}" ]; then
+            log "  The two versions are ${diff_show} apart, which usually means the file was saved"
+            log "  while a sync was running rather than edited in two places."
+        else
+            genuine=$(( genuine + 1 ))
+            log "  The two versions are far apart in time. Treat this as a real divergence:"
+            log "  compare both files before deleting either one."
+        fi
+        if [ -z "${first}" ]; then first="${path##*/}"; fi
+    done <<<"${paths}"
+    log "===== CONFLICT (${total} file(s), ${genuine} needing a decision) ====="
+
+    # Loud, but calibrated. Crying wolf over the self-inflicted race is how a
+    # notification becomes something you dismiss without reading.
+    body="${first}"
+    if [ "${total}" -gt 1 ]; then
+        body="${first} and $(( total - 1 )) more"
+    fi
+    if [ "${genuine}" -gt 0 ]; then
+        notify critical "Conflict: two versions of your work" \
+            "${body} changed on both sides and only you can say which is right. Both were kept, side by side. Details: loudsync --status" \
+            dialog-warning
+    else
+        notify normal "Conflict resolved: ${total} file(s)" \
+            "${body} was saved while a sync was running, so the newer version won and the older one was kept beside it. Nothing was lost. See: loudsync --status" \
+            emblem-default
+    fi
+}
+
 # --- Sync -------------------------------------------------------------------
 
 log "===== START (${REPO_COUNT} repos excluded) ====="
+
+LOG_OFFSET="$(stat -c %s "${LOG}" 2>/dev/null || echo 0)"
+RUN_STARTED="$(date +%s)"
+WAS_RACED="$(cat "${RACED}" 2>/dev/null || true)"
 
 set +e
 "${RCLONE_BIN}" bisync "${LOCAL_DIR}" "${REMOTE}" \
@@ -396,6 +684,14 @@ PREVIOUS=$(read_failures)
 if [ ${STATUS} -eq 0 ]; then
     log "===== DONE ====="
 
+    # Exit 0 is not the same as "nothing happened". A dry run only prints what
+    # it would do, so there is nothing to report and nothing to remember.
+    if [ "${DRY}" -eq 0 ]; then
+        SLICE="$(run_log_slice)"
+        report_conflicts "${SLICE}" "${WAS_RACED}"
+        detect_raced_files "${SLICE}" "${RUN_STARTED}"
+    fi
+
     # The filter snapshot is saved only after a run that actually worked, and
     # never after a dry run: saving it otherwise would compare the next change
     # against a state rclone never accepted.
@@ -406,7 +702,19 @@ if [ ${STATUS} -eq 0 ]; then
 
     if [ "${AUTO_RESYNC}" -eq 1 ]; then
         NOTE_TITLE="Sync exclusions updated"
-        NOTE_BODY="The git repository exclusions changed and the sync reconciled itself. Nothing was deleted."
+
+        # Naming the actual reason costs one line. Reporting an edit you made
+        # to the filter file as "the git repository exclusions changed" is a
+        # small lie, and small lies in notifications are how people stop
+        # reading them.
+        case "${RECONCILE_REASON}" in
+            *"was edited")
+                NOTE_BODY="Your filter file was edited, so the sync reconciled itself. Nothing was deleted." ;;
+            *repos*)
+                NOTE_BODY="A folder holding a git repo moved, so the sync reconciled itself. Nothing was deleted." ;;
+            *)
+                NOTE_BODY="The git repository exclusions changed and the sync reconciled itself. Nothing was deleted." ;;
+        esac
 
         # A rename on the remote is a change you didn't make by hand, so say so
         # and say how to take it back.

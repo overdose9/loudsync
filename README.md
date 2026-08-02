@@ -55,10 +55,53 @@ responsibility.
 - Being offline doesn't count as a failure. It's a laptop.
 - A safety brake aborts the run if it would delete more than half of either
   side.
+- **Conflicts are announced.** See below — this is the case where being quiet
+  costs the most.
+
+## Conflicts are not silent
+
+A sync tool resolving a conflict quietly is the same failure as a backup dying
+quietly, one level up. rclone handles it competently: it keeps the newer
+version, renames the loser, copies it across, and exits 0. Nothing you will
+ever see. The first you hear of it is a file with a strange suffix in your
+folder, days later, next to a copy of your document that is missing the last
+paragraph you wrote.
+
+So every conflict is written to the log with the file, which side won, by how
+much, and where the other version is — and it raises a desktop notification.
+
+It also says which kind of conflict it is, because the two kinds need
+completely different things from you:
+
+**One file racing itself.** You saved while a run was in flight. The run
+records in its listing the version it *saw*, then uploads the version it
+*reads* a second later, so on the next pass both sides look changed although
+only one machine ever touched the file. The winner is decided by a gap of
+seconds — effectively a coin toss. Nothing is lost, but the copy left behind is
+noise, and noise you don't understand is how you learn to ignore notifications.
+
+**A real divergence.** Two machines, or one machine and a stale copy. Only you
+can say which version counts.
+
+loudsync tells them apart on evidence rather than a guess: it remembers which
+files were still being written while the previous run was uploading them, and
+it reads the time gap between the two versions. A race gets a plain
+notification. A divergence gets a critical one, and `loudsync --status` lists
+every conflict copy still sitting in your folder waiting for a decision.
+
+Prevention comes first, though: **a run does not start while the folder is
+being written to.** If any file that would be synced changed in the last
+`QUIET_SECONDS` (15 by default), the run is postponed — and never more than
+`MAX_QUIET_SKIPS` times in a row, because something writing constantly must not
+be able to stop your backups. `loudsync --now` skips the wait.
+
+That reduces the race, it doesn't abolish it: a save landing after a run starts
+still races. What it removes is the common case, which is the run that fires
+while you are typing.
 
 ## Status
 
-**v0.2.0 — early.** Daily-driven by the author on Linux Mint against Google
+**v0.3.0 — early.** Daily-driven by the author on Linux Mint against Google
 Drive, roughly 800 files. It has not been tested at large scale, across many
 providers, or by anyone else yet.
 
@@ -119,8 +162,9 @@ separately and merged in automatically, so never list a repo there.
 
 ```sh
 loudsync                     # one run (this is what systemd calls)
-loudsync --status            # where things stand
+loudsync --status            # where things stand, and any conflict left to settle
 loudsync --dry-run           # show what would happen, change nothing
+loudsync --now               # don't wait for the folder to go quiet
 loudsync --resync            # rebuild sync state
 loudsync --propagate-rename  # you renamed a folder that contains a repo
 ```
@@ -145,7 +189,8 @@ for its turn.
 
 Under the hood it's `rclone bisync` with conflict resolution set to
 newest-wins. The loser is kept alongside the winner with a `.conflict-local` or
-`.conflict-remote` suffix rather than being thrown away.
+`.conflict-remote` suffix rather than being thrown away, and you get told about
+it.
 
 Files overwritten by a change coming *down* from the remote are copied to
 `~/.local/state/loudsync/versions/<date>/` first. That's the one case your
@@ -217,6 +262,18 @@ containing a repo, and the resulting plan was too large to apply unattended (or
 one side listed nothing at all). Run `loudsync --propagate-rename` in a
 terminal to see the plan and approve it. Smaller renames are handled without
 you; the log shows what was moved.
+
+**"a file changed on both sides"** — open both copies: the winner, and the one
+next to it ending in `.conflict-local` or `.conflict-remote`. The log says
+which side won and by how much. If the gap was seconds, it is almost certainly
+the same file saved while a sync was running, and the copy is redundant. Delete
+whichever one you don't want; `loudsync --status` lists the ones still pending.
+
+**Syncs are being postponed** — something is writing into the folder
+continuously. The log names the file. If it's something you don't need synced
+at all (a database, a log, a cache), exclude it in `filters-base.txt`; the
+exclusion also stops it from postponing runs. `QUIET_SECONDS=0` disables the
+wait entirely.
 
 **Nothing is being uploaded within seconds** — the watcher likely isn't
 running, or `inotify-tools` isn't installed. Check with
