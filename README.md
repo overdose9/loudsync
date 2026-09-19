@@ -85,7 +85,10 @@ can say which version counts.
 
 loudsync tells them apart on evidence rather than a guess: it remembers which
 files were still being written while the previous run was uploading them, and
-it reads the time gap between the two versions. A race gets a plain
+it reads the time gap between the two versions. It also counts only conflicts
+that actually happened: rclone flags a file as "changed in both paths" before
+comparing the two versions, and when they turn out identical it renames
+nothing. Only a renamed loser is reported. A race gets a plain
 notification. A divergence gets a critical one, and `loudsync --status` lists
 every conflict copy still sitting in your folder waiting for a decision.
 
@@ -101,7 +104,7 @@ while you are typing.
 
 ## Status
 
-**v0.3.0 — early.** Daily-driven by the author on Linux Mint against Google
+**v0.4.0 — early.** Daily-driven by the author on Linux Mint against Google
 Drive, roughly 800 files. It has not been tested at large scale, across many
 providers, or by anyone else yet.
 
@@ -171,7 +174,9 @@ loudsync --propagate-rename  # you renamed a folder that contains a repo
 
 Any other flag is passed straight through to `rclone bisync`.
 
-Logs: `~/.local/state/loudsync/loudsync.log`
+Logs: `~/.local/state/loudsync/loudsync.log`, rotated once it passes
+`LOG_MAX_MB` (50 by default), with the previous generations kept next to it
+as `loudsync.log.1`, `.2`, `.3`.
 
 ## How it works
 
@@ -268,6 +273,17 @@ next to it ending in `.conflict-local` or `.conflict-remote`. The log says
 which side won and by how much. If the gap was seconds, it is almost certainly
 the same file saved while a sync was running, and the copy is redundant. Delete
 whichever one you don't want; `loudsync --status` lists the ones still pending.
+
+**"Sync blocked by files you don't own"** — someone uploaded files straight
+into the shared remote folder, so they belong to that account, and no other
+account can delete or trash them: the provider answers 403 and bisync aborts
+on every run. It happens the moment you delete or move the local folder that
+held them. `loudsync --status` lists the files. Remove them from the folder in
+your provider's web interface (they stay in their owner's drive), or ask the
+owner to delete them; the next run then finishes on its own, no `--resync`
+needed. To find such files before they bite, with Google Drive:
+`rclone lsjson -R --files-only -M --drive-metadata-permissions read <remote>`
+and look at `Metadata.owner`.
 
 **Syncs are being postponed** — something is writing into the folder
 continuously. The log names the file. If it's something you don't need synced

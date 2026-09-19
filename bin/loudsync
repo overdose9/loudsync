@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 
 # --- Configuration ----------------------------------------------------------
 #
@@ -58,6 +58,8 @@ CONFLICT_RACE_SECONDS=120  # conflicts closer together than this look like a rac
 TRANSFERS=8
 CHECKERS=16
 NOTIFY=1
+LOG_MAX_MB=50           # rotate the log once it grows past this; 0 = never
+LOG_KEEP=3              # rotated generations to keep (loudsync.log.1 .. .N)
 
 if [ -f "${CONFIG_FILE}" ]; then
     # shellcheck source=/dev/null
@@ -84,6 +86,9 @@ FILTERS="${STATE_HOME}/filters-generated.txt"
 LOG="${STATE_HOME}/loudsync.log"
 LOCK="${STATE_HOME}/loudsync.lock"
 FAILURES="${STATE_HOME}/consecutive-failures"
+# Plain-language reason for the current failure streak, when the log names
+# one. Shown by --status, cleared by the next good run.
+FAIL_CAUSE="${STATE_HOME}/last-failure-cause"
 
 # Memory of the last good run's filters, so that when rclone refuses to run we
 # can say exactly what changed instead of reconstructing it afterwards.
@@ -115,6 +120,29 @@ LOCAL_VERSIONS_DIR="${STATE_HOME}/versions/${TODAY}"
 mkdir -p "${STATE_HOME}" "${CONFIG_HOME}"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') | $*" >>"${LOG}"; }
+
+# Rotate the log by size, keeping a few generations.
+#
+# A failure that repeats every two minutes writes the same delta over and over:
+# the author's log reached 405 MB in two days that way. A log that size is one
+# nobody opens, which defeats the point of writing it. Called once per run,
+# under the lock, before anything is written.
+rotate_log() {
+    local max_bytes size i
+    [ "${LOG_MAX_MB}" -gt 0 ] || return 0
+    max_bytes=$(( LOG_MAX_MB * 1024 * 1024 ))
+    size="$(stat -c %s "${LOG}" 2>/dev/null || echo 0)"
+    [ "${size}" -gt "${max_bytes}" ] || return 0
+    i="${LOG_KEEP}"
+    while [ "${i}" -gt 1 ]; do
+        if [ -f "${LOG}.$(( i - 1 ))" ]; then
+            mv -f "${LOG}.$(( i - 1 ))" "${LOG}.${i}"
+        fi
+        i=$(( i - 1 ))
+    done
+    mv -f "${LOG}" "${LOG}.1"
+    log "Log rotated at $(( size / 1024 / 1024 )) MB; the previous one is ${LOG}.1"
+}
 
 read_failures() { cat "${FAILURES}" 2>/dev/null || echo 0; }
 
@@ -191,6 +219,10 @@ if [ "${1:-}" = "--status" ]; then
     echo "  config:   ${CONFIG_FILE}"
     echo "  log:      ${LOG}"
     echo "  failures: $(read_failures) in a row"
+    if [ "$(read_failures)" -gt 0 ] && [ -s "${FAIL_CAUSE}" ]; then
+        echo "  why it is failing:"
+        sed 's/^/    /' "${FAIL_CAUSE}"
+    fi
     if [ -s "${REPOS_PREVIOUS}" ]; then
         echo "  excluded git repos: $(wc -l <"${REPOS_PREVIOUS}")"
     fi
@@ -199,8 +231,15 @@ if [ "${1:-}" = "--status" ]; then
         echo "  postponed: ${SKIPPED} run(s) in a row, the folder is being written to"
     fi
     if [ -f "${LOG}" ]; then
-        echo "  last run: $(grep -E '===== (DONE|FAILED)' "${LOG}" | tail -1 || echo 'never')"
-        echo "  last conflict: $(grep -E '===== CONFLICT' "${LOG}" | tail -1 || echo 'none recorded')"
+        # The rotated log first, so the newest line wins when the current one
+        # is still young. Only files that exist: under pipefail, grep failing
+        # on a missing file would turn a line it did find into "never".
+        LOG_FILES=()
+        for f in "${LOG}.1" "${LOG}"; do
+            if [ -f "${f}" ]; then LOG_FILES+=("${f}"); fi
+        done
+        echo "  last run: $(grep -hE '===== (DONE|FAILED)' "${LOG_FILES[@]}" | tail -1 || echo 'never')"
+        echo "  last conflict: $(grep -hE '===== CONFLICT' "${LOG_FILES[@]}" | tail -1 || echo 'none recorded')"
     fi
 
     # Conflict copies pile up silently and every one of them is a decision
@@ -227,6 +266,8 @@ if ! flock -n 9; then
     log "A sync is already running; skipping this one."
     exit 0
 fi
+
+rotate_log
 
 DRY=0
 WANTS_RESYNC=0
@@ -545,10 +586,63 @@ report_conflicts() {
     local paths path line winner diff loser sep rest
     local diff_show diff_whole
     local total=0 genuine=0 first="" body=""
+    local flagged not_renamed=0
     declare -A WINNER_OF DIFF_OF
 
-    paths="$(printf '%s\n' "${slice}" \
+    flagged="$(printf '%s\n' "${slice}" \
         | sed -n 's/^.*NOTICE: - WARNING  *New or changed in both paths  *- \(.*\)$/\1/p' | sort -u)"
+    [ -n "${flagged}" ] || return 0
+
+    # That warning is raised BEFORE rclone compares the two versions. When they
+    # turn out identical (both sides already had the same upload and only the
+    # listing was behind) it logs "Files are equal! Skipping" and renames
+    # nothing; directories are never renamed at all. A conflict is a renamed
+    # loser, so that rename line is what counts. Counting the warnings instead
+    # once announced 266 conflicts of which zero existed (19-09-2026), which is
+    # exactly the alarm that teaches you to stop reading alarms.
+    #
+    # The rename line names the loser with its full prefix: the local folder
+    # for Path1, "remote{hash}:path/" for Path2. Both are stripped and the
+    # result compared whole, because a substring match confuses a path with
+    # any longer path that ends the same way.
+    local renamed_path remote_path
+    declare -A RENAMED
+    remote_path="${REMOTE#*:}"
+    remote_path="${remote_path%/}"
+    while IFS= read -r line; do
+        case "${line}" in
+            *" Renaming Path1 copy "*|*" Renaming Path2 copy "*) ;;
+            *) continue ;;
+        esac
+        renamed_path="${line#* Renaming Path? copy }"
+        renamed_path="${renamed_path#"${renamed_path%%[! ]*}"}"
+        renamed_path="${renamed_path#- }"
+        case "${line}" in
+            *" Renaming Path1 copy "*)
+                renamed_path="${renamed_path#"${LOCAL_DIR%/}/"}" ;;
+            *)
+                renamed_path="${renamed_path#*:}"
+                if [ -n "${remote_path}" ]; then
+                    renamed_path="${renamed_path#"${remote_path}/"}"
+                fi ;;
+        esac
+        renamed_path="${renamed_path%.conflict-local}"
+        renamed_path="${renamed_path%.conflict-remote}"
+        RENAMED["${renamed_path}"]=1
+    done <<<"${slice}"
+
+    paths=""
+    while IFS= read -r path; do
+        [ -n "${path}" ] || continue
+        if [ -n "${RENAMED[${path}]:-}" ]; then
+            paths="${paths}${path}"$'\n'
+        else
+            not_renamed=$(( not_renamed + 1 ))
+        fi
+    done <<<"${flagged}"
+    if [ "${not_renamed}" -gt 0 ]; then
+        log "${not_renamed} path(s) flagged as changed on both sides were identical or directories; nothing was renamed, so they are not conflicts."
+    fi
     [ -n "${paths}" ] || return 0
 
     while IFS= read -r line; do
@@ -746,9 +840,40 @@ if [ ${STATUS} -eq 0 ]; then
         log "Recovered after ${PREVIOUS} consecutive failures."
     fi
     echo 0 >"${FAILURES}"
+    rm -f "${FAIL_CAUSE}"
 else
     log "===== FAILED (exit=${STATUS}) ====="
     log "If the state is out of step, reconcile with: $0 --resync"
+
+    # Some failures have one specific cause the generic alert cannot name.
+    # Files inside the synced tree that belong to another account (someone
+    # uploaded them straight into a shared folder) cannot be deleted or
+    # trashed by anyone but their owner: the provider answers 403, bisync
+    # aborts, and it will abort again on every run until a human moves them
+    # out. The author's sync sat dead for 37 hours over seven such files
+    # while the alert said only "check the log". Name the cause, name the
+    # files, say what to do.
+    FOREIGN="$(run_log_slice \
+        | sed -n "s/^.*ERROR : \(.*\): Couldn't [a-z]*: .*403.*insufficientFilePermissions.*\$/\1/p" \
+        | sort -u)"
+    CAUSE_TITLE=""
+    CAUSE_BODY=""
+    if [ -n "${FOREIGN}" ]; then
+        FOREIGN_COUNT="$(printf '%s\n' "${FOREIGN}" | wc -l)"
+        FOREIGN_FIRST="$(printf '%s\n' "${FOREIGN}" | head -1)"
+        {
+            echo "${FOREIGN_COUNT} file(s) on the remote belong to another account, so this one cannot delete them (403 insufficientFilePermissions):"
+            printf '%s\n' "${FOREIGN}" | sed 's/^/  /'
+            echo "The sync will fail on every run until they are out of the synced tree: remove them from the folder in your provider's web interface, or ask their owner to delete them."
+        } >"${FAIL_CAUSE}"
+        while IFS= read -r line; do log "  cause | ${line}"; done <"${FAIL_CAUSE}"
+        CAUSE_TITLE="Sync blocked by files you don't own"
+        CAUSE_BODY="${FOREIGN_FIRST##*/}"
+        if [ "${FOREIGN_COUNT}" -gt 1 ]; then
+            CAUSE_BODY="${CAUSE_BODY} and $(( FOREIGN_COUNT - 1 )) more"
+        fi
+        CAUSE_BODY="${CAUSE_BODY} belong(s) to another account and can't be deleted from here, so every run fails. Move them out of the synced folder in your provider's web interface, or ask the owner to delete them. Details: loudsync --status"
+    fi
 
     if ! have_network; then
         log "No network: not counted as a failure."
@@ -761,9 +886,13 @@ else
         # noise that gets learned away.
         if [ "${N}" -eq "${FAIL_THRESHOLD}" ] \
            || { [ "${N}" -gt "${FAIL_THRESHOLD}" ] && [ $(( N % REMIND_EVERY )) -eq 0 ]; }; then
-            notify critical "Sync is not running" \
-                "${N} failed attempts in a row. Check: tail -40 ${LOG}" \
-                dialog-error
+            if [ -n "${CAUSE_TITLE}" ]; then
+                notify critical "${CAUSE_TITLE}" "${CAUSE_BODY}" dialog-error
+            else
+                notify critical "Sync is not running" \
+                    "${N} failed attempts in a row. Check: tail -40 ${LOG}" \
+                    dialog-error
+            fi
         fi
     fi
 fi

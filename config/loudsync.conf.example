@@ -84,6 +84,13 @@ WATCH_DEBOUNCE=5
 TRANSFERS=8
 CHECKERS=16
 
+# Rotate the log once it grows past this many MB, keeping LOG_KEEP older
+# generations as loudsync.log.1, .2, ... A failure that repeats every two
+# minutes rewrites the same delta each time and can reach hundreds of MB in a
+# couple of days; a log that size is one nobody opens. 0 disables rotation.
+LOG_MAX_MB=50
+LOG_KEEP=3
+
 # Set to 0 to disable desktop notifications entirely. Not recommended: the
 # whole point of this tool is that it tells you when it breaks.
 NOTIFY=1
