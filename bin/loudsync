@@ -205,7 +205,7 @@ die() { log "ERROR: $*"; echo "loudsync: $*" >&2; exit 1; }
 [ -f "${FILTERS_BASE}" ] || die "missing filter file: ${FILTERS_BASE}"
 
 REMOTE_NAME="${REMOTE%%:*}"
-if ! "${RCLONE_BIN}" listremotes 2>/dev/null | grep -q "^${REMOTE_NAME}:"; then
+if ! "${RCLONE_BIN}" listremotes 2>/dev/null | grep -Fxq "${REMOTE_NAME}:"; then
     die "rclone remote '${REMOTE_NAME}' is not configured. Run: rclone config"
 fi
 
@@ -313,6 +313,14 @@ fi
 echo 0 >"${QUIET_SKIPS}"
 
 # --- Filters: git repos discovered on every run -----------------------------
+
+# The repo list below is line-oriented, so a repo path containing a newline
+# would be split in two and produce a corrupt filter. Count NUL-terminated
+# entries against newline-terminated lines and refuse to run if they differ.
+_repo_entries=$( ( cd "${LOCAL_DIR}" && find . -maxdepth "${MAX_REPO_DEPTH}" -name ".git" -prune -print0 2>/dev/null ) | tr -cd '\0' | wc -c )
+_repo_lines=$( ( cd "${LOCAL_DIR}" && find . -maxdepth "${MAX_REPO_DEPTH}" -name ".git" -prune 2>/dev/null ) | wc -l )
+[ "${_repo_entries}" -eq "${_repo_lines}" ] \
+    || die "a git repository path under ${LOCAL_DIR} contains a newline; rename it before syncing"
 
 ( cd "${LOCAL_DIR}" && find . -maxdepth "${MAX_REPO_DEPTH}" -name ".git" -prune 2>/dev/null ) \
     | sed 's|^\./||; s|/\.git$||; /^$/d' | sort >"${REPOS_CURRENT}"
