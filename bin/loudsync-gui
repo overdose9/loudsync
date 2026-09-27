@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""loudsync's tray icon and window.
+
+    loudsync-gui               open the window (or the setup assistant)
+    loudsync-gui --background  tray icon only; what the login autostart runs
+
+Works from a checkout (the engine next to this file, the interface in ../gui)
+and once installed (~/.local/bin, with the interface in
+~/.local/share/loudsync/gui).
+
+Copyright (C) 2026 Sebastián Flores
+Licensed under the GNU General Public License v3.0 or later.
+"""
+
+import os
+import sys
+
+here = os.path.dirname(os.path.realpath(__file__))
+data_home = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+for candidate in (os.path.join(here, "..", "gui"), os.path.join(data_home, "loudsync", "gui")):
+    if os.path.isdir(os.path.join(candidate, "loudsync_gui")):
+        sys.path.insert(0, os.path.normpath(candidate))
+        break
+else:
+    sys.exit("loudsync-gui: the interface files are missing. Run install.sh again.")
+
+# The engine this launcher shipped with sits next to it. Pointing at it
+# explicitly keeps a checkout from driving an older installed engine.
+if os.access(os.path.join(here, "loudsync"), os.X_OK):
+    os.environ.setdefault("LOUDSYNC_ENGINE_DIR", here)
+
+try:
+    from loudsync_gui.app import main
+except (ImportError, ValueError) as e:
+    sys.exit(f"loudsync-gui needs GTK 3 for Python (PyGObject): {e}\n"
+             "On Debian, Ubuntu or Mint: sudo apt install python3-gi gir1.2-gtk-3.0")
+
+sys.exit(main(sys.argv))

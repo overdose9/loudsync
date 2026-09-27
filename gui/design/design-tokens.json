@@ -1,0 +1,307 @@
+{
+  "_nota": "Derivado de direccion-de-arte.md. Superficies, texto y tipografia los pone el tema GTK del usuario; aqui solo van los colores propios de loudsync.",
+  "color": {
+    "state": {
+      "ok": {
+        "light": "#1b6e45",
+        "dark": "#5fcf8f"
+      },
+      "syncing": {
+        "light": "#1a5bb0",
+        "dark": "#74aeff"
+      },
+      "paused": {
+        "light": "#565d6b",
+        "dark": "#b3bac7"
+      },
+      "warning": {
+        "light": "#9a4300",
+        "dark": "#ffa566"
+      },
+      "error": {
+        "light": "#b0241b",
+        "dark": "#ff8f85"
+      }
+    },
+    "surface": "theme_bg_color (del tema)",
+    "text": "theme_fg_color (del tema)",
+    "tray": {
+      "ok": "#2e9b5f",
+      "syncing": "#3a7fd8",
+      "paused": "#848b98",
+      "warning": "#c96f00",
+      "error": "#e5372e"
+    }
+  },
+  "typography": {
+    "family": "fuente de interfaz del sistema",
+    "monospace": "fuente monoespaciada del sistema",
+    "scale_ratio": 1.2,
+    "sizes_pango": {
+      "display": "xx-large",
+      "headline": "x-large",
+      "title": "large",
+      "body": "medium",
+      "caption": "small"
+    },
+    "weights": {
+      "display": "bold",
+      "headline": "bold",
+      "title": "bold",
+      "body": "normal"
+    }
+  },
+  "spacing": {
+    "base_px": 6,
+    "scale": [
+      6,
+      12,
+      18,
+      24,
+      36
+    ]
+  },
+  "radius": "del tema",
+  "motion": {
+    "duration_ms": 200,
+    "easing": "ease-out (transiciones de Gtk.Revealer/Gtk.Stack)",
+    "reduced_motion": "si gtk-enable-animations es falso, sin transiciones; el spinner es el unico movimiento continuo y solo mientras corre una sincronizacion"
+  },
+  "contrast_pairs": [
+    {
+      "foreground": "#1b6e45",
+      "background": "#f8f8f9",
+      "uso": "estado ok (claro) sobre Mint-Y ventana",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#1b6e45",
+      "background": "#f6f5f4",
+      "uso": "estado ok (claro) sobre Adwaita ventana",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#1b6e45",
+      "background": "#ffffff",
+      "uso": "estado ok (claro) sobre fila de lista (base)",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#5fcf8f",
+      "background": "#212121",
+      "uso": "estado ok (oscuro) sobre Orchis-Dark ventana",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#5fcf8f",
+      "background": "#2c2c2c",
+      "uso": "estado ok (oscuro) sobre Orchis-Dark base",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#5fcf8f",
+      "background": "#2e2e33",
+      "uso": "estado ok (oscuro) sobre Mint-Y-Dark ventana",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#5fcf8f",
+      "background": "#353535",
+      "uso": "estado ok (oscuro) sobre Adwaita-dark ventana",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#1a5bb0",
+      "background": "#f8f8f9",
+      "uso": "estado syncing (claro) sobre Mint-Y ventana",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#1a5bb0",
+      "background": "#f6f5f4",
+      "uso": "estado syncing (claro) sobre Adwaita ventana",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#1a5bb0",
+      "background": "#ffffff",
+      "uso": "estado syncing (claro) sobre fila de lista (base)",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#74aeff",
+      "background": "#212121",
+      "uso": "estado syncing (oscuro) sobre Orchis-Dark ventana",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#74aeff",
+      "background": "#2c2c2c",
+      "uso": "estado syncing (oscuro) sobre Orchis-Dark base",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#74aeff",
+      "background": "#2e2e33",
+      "uso": "estado syncing (oscuro) sobre Mint-Y-Dark ventana",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#74aeff",
+      "background": "#353535",
+      "uso": "estado syncing (oscuro) sobre Adwaita-dark ventana",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#565d6b",
+      "background": "#f8f8f9",
+      "uso": "estado paused (claro) sobre Mint-Y ventana",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#565d6b",
+      "background": "#f6f5f4",
+      "uso": "estado paused (claro) sobre Adwaita ventana",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#565d6b",
+      "background": "#ffffff",
+      "uso": "estado paused (claro) sobre fila de lista (base)",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#b3bac7",
+      "background": "#212121",
+      "uso": "estado paused (oscuro) sobre Orchis-Dark ventana",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#b3bac7",
+      "background": "#2c2c2c",
+      "uso": "estado paused (oscuro) sobre Orchis-Dark base",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#b3bac7",
+      "background": "#2e2e33",
+      "uso": "estado paused (oscuro) sobre Mint-Y-Dark ventana",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#b3bac7",
+      "background": "#353535",
+      "uso": "estado paused (oscuro) sobre Adwaita-dark ventana",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#9a4300",
+      "background": "#f8f8f9",
+      "uso": "estado warning (claro) sobre Mint-Y ventana",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#9a4300",
+      "background": "#f6f5f4",
+      "uso": "estado warning (claro) sobre Adwaita ventana",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#9a4300",
+      "background": "#ffffff",
+      "uso": "estado warning (claro) sobre fila de lista (base)",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#ffa566",
+      "background": "#212121",
+      "uso": "estado warning (oscuro) sobre Orchis-Dark ventana",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#ffa566",
+      "background": "#2c2c2c",
+      "uso": "estado warning (oscuro) sobre Orchis-Dark base",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#ffa566",
+      "background": "#2e2e33",
+      "uso": "estado warning (oscuro) sobre Mint-Y-Dark ventana",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#ffa566",
+      "background": "#353535",
+      "uso": "estado warning (oscuro) sobre Adwaita-dark ventana",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#b0241b",
+      "background": "#f8f8f9",
+      "uso": "estado error (claro) sobre Mint-Y ventana",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#b0241b",
+      "background": "#f6f5f4",
+      "uso": "estado error (claro) sobre Adwaita ventana",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#b0241b",
+      "background": "#ffffff",
+      "uso": "estado error (claro) sobre fila de lista (base)",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#ff8f85",
+      "background": "#212121",
+      "uso": "estado error (oscuro) sobre Orchis-Dark ventana",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#ff8f85",
+      "background": "#2c2c2c",
+      "uso": "estado error (oscuro) sobre Orchis-Dark base",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#ff8f85",
+      "background": "#2e2e33",
+      "uso": "estado error (oscuro) sobre Mint-Y-Dark ventana",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#ff8f85",
+      "background": "#353535",
+      "uso": "estado error (oscuro) sobre Adwaita-dark ventana",
+      "min_ratio": 4.5
+    },
+    {
+      "foreground": "#c96f00",
+      "background": "#2b2b2b",
+      "uso": "icono de bandeja warning sobre panel oscuro Cinnamon",
+      "min_ratio": 3.0
+    },
+    {
+      "foreground": "#c96f00",
+      "background": "#f0f0f0",
+      "uso": "icono de bandeja warning sobre panel claro",
+      "min_ratio": 3.0
+    },
+    {
+      "foreground": "#e5372e",
+      "background": "#2b2b2b",
+      "uso": "icono de bandeja error sobre panel oscuro Cinnamon",
+      "min_ratio": 3.0
+    },
+    {
+      "foreground": "#e5372e",
+      "background": "#f0f0f0",
+      "uso": "icono de bandeja error sobre panel claro",
+      "min_ratio": 3.0
+    }
+  ],
+  "_nota_tray": "Colores de la bandeja: el panel puede ser claro u oscuro, asi que es un tono medio que cumple 3:1 (componente de interfaz) contra ambos. Solo se usan en estados de alerta; los estados tranquilos son simbolicos y los colorea el tema."
+}

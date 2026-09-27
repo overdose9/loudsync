@@ -121,6 +121,8 @@ this.
 | `systemd` (user session) | required for the automation |
 | `inotify-tools` | optional — without it, uploads wait for the timer |
 | `notify-send` | optional — no desktop alerts without it |
+| GTK 3 for Python (`python3-gi`, `gir1.2-gtk-3.0`) | optional — the tray icon and window |
+| XApp or AyatanaAppIndicator introspection | optional — the tray icon itself; without either, the window alone |
 
 ## Install
 
@@ -141,6 +143,11 @@ $EDITOR ~/.config/loudsync/loudsync.conf
 loudsync --resync              # first run: builds the sync state
 systemctl --user enable --now loudsync.timer loudsync-watch.service
 ```
+
+On a desktop, you can skip the rest of this section: open **loudsync** from your
+applications menu and its setup assistant picks the folder, connects your cloud
+account through rclone's browser sign-in, previews the first sync and turns on
+the automation.
 
 To remove it: `./install.sh --uninstall`. Your config, logs and data stay.
 
@@ -177,6 +184,28 @@ Any other flag is passed straight through to `rclone bisync`.
 Logs: `~/.local/state/loudsync/loudsync.log`, rotated once it passes
 `LOG_MAX_MB` (50 by default), with the previous generations kept next to it
 as `loudsync.log.1`, `.2`, `.3`.
+
+## The desktop interface
+
+A tray icon and a window, like the Drive or OneDrive clients, over the same
+engine. `loudsync-gui` opens it; the installer also starts the tray icon at
+login (turn that off in its Settings).
+
+- **The icon is the status.** A cloud with a check when everything is up to
+  date. When something needs you, it turns colour and grows sound waves: the
+  lookout shouting. Calm states follow your panel's colours.
+- **Status** answers "is it working?" with the time of the last finished run,
+  never with a guess, and puts the cause and the fix of a failure in front of
+  you — including the rename plan the engine stopped for.
+- **Conflicts** lists every file that changed on both sides with both
+  versions' origin, date and size. Keep one; the other goes to the trash, not
+  to deletion.
+- **Settings** and **Filters** edit `loudsync.conf` and `filters-base.txt`
+  in place, comments and all. Changing the folder or the cloud account pauses
+  syncing, previews the new pair and only then runs the first sync.
+
+It holds no state of its own. Close it, or never install it, and syncing works
+exactly the same, because that runs under systemd, not inside the window.
 
 ## How it works
 
@@ -251,7 +280,6 @@ on the other side.
 
 ## What it deliberately does not do
 
-- **No GUI.** Not yet. Possibly later.
 - **No one-way / backup-only mode.** It's a two-way sync.
 - **No remote-side versioning.** Your provider already does that; duplicating
   it burns quota and grows a dated folder nobody prunes.

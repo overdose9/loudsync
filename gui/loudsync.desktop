@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=loudsync
+GenericName=Folder sync
+Comment=Two-way sync of a folder with your cloud, loud when it breaks
+Exec=@BINDIR@/loudsync-gui
+Icon=loudsync
+Terminal=false
+Categories=Utility;FileTools;Network;
+Keywords=sync;backup;cloud;drive;rclone;
+StartupNotify=true
+StartupWMClass=loudsync
+X-GNOME-UsesNotifications=true
