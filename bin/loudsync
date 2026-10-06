@@ -31,7 +31,7 @@
 
 set -euo pipefail
 
-VERSION="0.4.0"
+VERSION="0.4.1"
 
 # --- Configuration ----------------------------------------------------------
 #
@@ -762,9 +762,16 @@ LOG_OFFSET="$(stat -c %s "${LOG}" 2>/dev/null || echo 0)"
 RUN_STARTED="$(date +%s)"
 WAS_RACED="$(cat "${RACED}" 2>/dev/null || true)"
 
+# --max-lock: without it, bisync's own lock file never expires, so a run that
+# dies before cleaning up (systemd's timeout, a crash, a power cut) blocks every
+# later run until someone deletes the file by hand. That happened: a 30-minute
+# run was killed mid-upload and the sync sat dead for 23 runs with "prior lock
+# file found". The flock above already guarantees one run at a time; bisync
+# renews its lock while it works, so expiring it only ever frees a dead one.
 set +e
 "${RCLONE_BIN}" bisync "${LOCAL_DIR}" "${REMOTE}" \
     --filters-file "${FILTERS}" \
+    --max-lock 5m \
     --conflict-resolve "${CONFLICT_RESOLVE}" \
     --conflict-loser pathname \
     --conflict-suffix conflict-local,conflict-remote \

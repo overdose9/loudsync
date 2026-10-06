@@ -313,6 +313,13 @@ needed. To find such files before they bite, with Google Drive:
 `rclone lsjson -R --files-only -M --drive-metadata-permissions read <remote>`
 and look at `Metadata.owner`.
 
+**"prior lock file found"** — a bisync run died before cleaning up (killed by
+the service timeout, a crash, a power cut) and left its lock behind. Since
+0.4.1 the lock expires on its own five minutes after the run that held it
+stopped renewing it, and the next run recovers with `--recover`. A lock left by
+an older version never expires: check that no `rclone bisync` is running
+(`pgrep -af 'rclone bisync'`) and delete the `.lck` file the log names.
+
 **Syncs are being postponed** — something is writing into the folder
 continuously. The log names the file. If it's something you don't need synced
 at all (a database, a log, a cache), exclude it in `filters-base.txt`; the
