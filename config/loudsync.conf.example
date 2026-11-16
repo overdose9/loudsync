@@ -77,8 +77,42 @@ FAIL_THRESHOLD=3
 # doesn't turn into noise you learn to ignore. 60 = roughly once an hour.
 REMIND_EVERY=60
 
-# Seconds the watcher waits after a change before syncing, to group bursts.
+# --- Speed -------------------------------------------------------------------
+
+# The fast lane. A file you save is uploaded directly, a few seconds later,
+# instead of waiting for a pass that lists everything on both sides first.
+#
+# It only ever copies a local file up, and only when the remote still holds
+# the exact version the last full pass recorded. Deletions, renames, pulling
+# changes down and anything that looks like a conflict stay with the full
+# pass. Set to 0 to make every change wait for one, as before 0.5.0.
+FAST_LANE=1
+
+# Seconds a file must stay untouched before the fast lane sends it. Each file
+# waits on its own clock, so one that is written constantly doesn't hold back
+# the others.
 WATCH_DEBOUNCE=5
+
+# More changed files than this at once are left to the full pass: a bulk
+# change is what a listing is good at.
+FAST_MAX_FILES=25
+
+# How often the watcher asks the remote whether anything changed there. It is
+# one cheap query (Google Drive only for now), not a listing; a positive answer
+# starts a full pass. Other backends ignore this and get a full pass a minute.
+REMOTE_POLL_SECONDS=15
+
+# The longest a full pass can be put off while nothing seems to change. The
+# query above does not see everything: a file deleted or renamed on the
+# remote, or uploaded from a machine that was offline when it was edited,
+# only shows up in a full listing. This bounds how long those wait.
+FULL_SYNC_SECONDS=300
+
+# List the remote recursively in a few large requests (rclone --fast-list)
+# instead of one request per folder. On a remote with thousands of folders
+# this takes a full pass from minutes to about one. It uses more memory;
+# set to 0 on a very small machine.
+FAST_LIST=1
 
 # rclone parallelism. Lower these on a slow link or a low-powered machine.
 TRANSFERS=8

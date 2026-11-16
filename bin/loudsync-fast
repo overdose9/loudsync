@@ -1,0 +1,714 @@
+#!/usr/bin/env python3
+"""
+loudsync-fast — the fast lane: what makes a change travel in seconds.
+
+A full pass (rclone bisync) lists both sides from top to bottom before it
+moves a single byte. Against a cloud provider that listing is the whole cost
+of a run: about a minute for 19,000 remote entries on the author's Drive, to
+upload one file that changed. This helper removes the listing from the two
+cases that make up nearly all of a normal day:
+
+  up     You saved a file. It is uploaded directly, after asking the remote
+         about that one path, instead of waiting for a pass over everything.
+
+  probe  Did anything change on the remote? One cheap query instead of a full
+         listing, so the full pass only runs when there is something to pull.
+
+Neither replaces the full pass, and that is deliberate. bisync stays the only
+thing that deletes, renames, resolves a conflict or pulls a file down. The
+fast lane only ever copies a local file up, and only when it can show the
+remote copy is exactly the one recorded in bisync's listing. Anything it
+cannot show — the remote moved too, the listing is missing, the filters
+changed, the sync is failing — is left to the full pass, which is where
+conflicts get announced. Declining is always safe; guessing is not.
+
+After an upload it has confirmed, the fast lane writes the file's new size
+and time into both of bisync's listings, the same entry bisync itself would
+have written had it done the upload. This is not bookkeeping, it is what
+keeps the two from fighting. Leave the listing alone and the next full pass
+finds the file changed on BOTH sides compared with what it remembers. If
+they are still identical, fine. But on a machine where files keep being
+written, the file has often moved on by then, and bisync reads that as two
+diverging edits: a conflict copy of your own earlier save, a critical alert
+about a divergence that never happened, or an aborted pass. The first
+version of this lane did exactly that within ten minutes of being installed
+(16-11-2026). With the listing kept true, a later edit is what it is: one
+side changed.
+
+What the fast lane must never do is upload something the filters exclude.
+The filter decision is therefore not reimplemented here: rclone lists the
+local folder through the same generated filter file the full pass uses, and
+only paths in that listing are eligible. On top of that, anything under a
+directory holding a .git is skipped outright, because a repo cloned a minute
+ago is not in the generated filters yet.
+
+Exit codes
+  up:    0  everything in the batch is dealt with
+         10 a full pass is needed (something here is not the fast lane's job)
+         11 a sync holds the lock right now; try this batch again shortly
+  probe: 0  the remote has changes the last full pass has not seen
+         20 nothing new
+         21 this remote cannot be probed; keep the timed full passes
+         22 could not ask right now (offline, timeout); no information
+
+"Nothing new" is deliberately not 1. That is what Python exits with when it
+crashes, and a crash must never read as "the remote is quiet": callers treat
+any code they don't know as a reason to run a full pass.
+
+Copyright (C) 2026 Sebastián Flores
+Licensed under the GNU General Public License v3.0 or later.
+"""
+
+import argparse
+import calendar
+import fcntl
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+UP_OK, UP_NEEDS_FULL, UP_BUSY = 0, 10, 11
+PROBE_CHANGED, PROBE_NOTHING, PROBE_UNSUPPORTED, PROBE_ERROR = 0, 20, 21, 22
+
+LISTING_HEADER = "# bisync listing v1"
+CONFLICT_SUFFIXES = (".conflict-local", ".conflict-remote")
+
+# Slack on the probe's "since" timestamp, for the gap between this clock and
+# the provider's.
+PROBE_MARGIN_SECONDS = 10
+
+# Coarser than this and a remote's modification times can't tell two saves
+# apart. Dropbox and OneDrive keep whole seconds; some backends keep none.
+MAX_PRECISION_MS = 2000
+
+RCLONE_TIMEOUT = 120
+PROBE_TIMEOUT = 30
+REMOTE_INFO_MAX_AGE = 24 * 3600
+
+
+# --- Small helpers ----------------------------------------------------------
+
+_TIME_RE = re.compile(
+    r"^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.(\d+))?(Z|[+-]\d\d:?\d\d)$")
+
+
+def to_ms(stamp):
+    """An RFC 3339 timestamp, as rclone writes it anywhere, in whole
+    milliseconds since the epoch. None if it cannot be read."""
+    m = _TIME_RE.match(stamp.strip())
+    if not m:
+        return None
+    year, month, day, hour, minute, second = (int(g) for g in m.groups()[:6])
+    seconds = calendar.timegm((year, month, day, hour, minute, second, 0, 0, 0))
+    zone = m.group(8)
+    if zone != "Z":
+        sign = -1 if zone[0] == "-" else 1
+        digits = zone[1:].replace(":", "")
+        seconds -= sign * (int(digits[:2]) * 3600 + int(digits[2:]) * 60)
+    frac = (m.group(7) or "0")[:9].ljust(9, "0")
+    return seconds * 1000 + int(frac) // 1_000_000
+
+
+def same_version(a, b, tolerance_ms):
+    """Two (size, mtime_ms) pairs describing the same version of a file."""
+    if a is None or b is None:
+        return False
+    return a[0] == b[0] and abs(a[1] - b[1]) <= tolerance_ms
+
+
+def session_name(path1, path2):
+    """The file name stem bisync gives the listings of a path pair."""
+    def canonical(p, local):
+        p = p.rstrip("/")
+        if local:
+            p = p.lstrip("/")
+        return re.sub(r"[\s\\/:?*]", "_", p)
+    return canonical(path1, True) + ".." + canonical(path2, False)
+
+
+def read_listing(path):
+    """{relative path: (size, mtime_ms)} for the files in a bisync listing,
+    plus the set of directories. None if the file is missing or is not a
+    format this code knows — in which case the fast lane stands down."""
+    files, dirs = {}, set()
+    try:
+        with open(path, encoding="utf-8", errors="surrogateescape") as f:
+            first = f.readline()
+            if not first.startswith(LISTING_HEADER):
+                return None
+            for line in f:
+                m = re.match(r'^(\S)\s+(-?\d+)\s+\S+\s+\S+\s+(\S+)\s+"(.*)"$',
+                             line.rstrip("\n"))
+                if not m:
+                    continue
+                kind, size, stamp, quoted = m.groups()
+                try:
+                    name = json.loads('"' + quoted + '"')
+                except ValueError:
+                    # An escape JSON doesn't share with Go. Without the entry
+                    # the path reads as unknown, which only ever declines.
+                    continue
+                if kind == "d":
+                    dirs.add(name)
+                    continue
+                ms = to_ms(stamp)
+                if ms is not None:
+                    files[name] = (int(size), ms)
+    except OSError:
+        return None
+    return files, dirs
+
+
+def listing_stamp(ns):
+    seconds, frac = divmod(ns, 1_000_000_000)
+    return (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(seconds))
+            + f".{frac:09d}+0000")
+
+
+def listing_line(kind, size, ns, rel):
+    # The exact shape bisync writes: kind, size right-aligned to 8, no hash,
+    # no id, time in UTC with nanoseconds, the path quoted.
+    return f"{kind} {size:8d} - - {listing_stamp(ns)} {json.dumps(rel, ensure_ascii=False)}\n"
+
+
+def record_in_listing(path, files, dirs):
+    """Write the given files ({rel: (size, mtime_ns)}) and directories
+    ({rel: mtime_ns}, added only if absent) into a bisync listing. Every
+    other line is carried over byte for byte, in the order bisync left it."""
+    with open(path, encoding="utf-8", errors="surrogateescape") as f:
+        lines = f.readlines()
+    if not lines or not lines[0].startswith(LISTING_HEADER):
+        raise ValueError("not a listing this code knows")
+    keyed = []          # (path or None, raw line)
+    index = {}
+    for raw in lines[1:]:
+        name = None
+        m = re.match(r'^\S\s+-?\d+\s+\S+\s+\S+\s+\S+\s+"(.*)"$', raw.rstrip("\n"))
+        if m:
+            try:
+                name = json.loads('"' + m.group(1) + '"')
+            except ValueError:
+                name = None
+        if name is not None:
+            index[name] = len(keyed)
+        keyed.append((name, raw))
+
+    def put(rel, raw):
+        if rel in index:
+            keyed[index[rel]] = (rel, raw)
+            return
+        # bisync keeps the listing sorted by path; keep it that way.
+        at = len(keyed)
+        for i, (name, _raw) in enumerate(keyed):
+            if name is not None and name > rel:
+                at = i
+                break
+        keyed.insert(at, (rel, raw))
+        index.clear()
+        index.update({name: i for i, (name, _r) in enumerate(keyed) if name is not None})
+
+    for rel, ns in sorted(dirs.items()):
+        if rel not in index:
+            put(rel, listing_line("d", -1, ns, rel))
+    for rel, (size, ns) in sorted(files.items()):
+        put(rel, listing_line("-", size, ns, rel))
+
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".fast-lst-")
+    with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape") as f:
+        f.write(lines[0])
+        f.writelines(raw for _name, raw in keyed)
+    os.chmod(tmp, os.stat(path).st_mode & 0o777)
+    os.replace(tmp, path)
+
+
+def read_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".fast-")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def read_int(path, default=0):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return int(f.read().strip() or default)
+    except (OSError, ValueError):
+        return default
+
+
+def read_lines(path):
+    if not path:
+        return []
+    try:
+        with open(path, encoding="utf-8", errors="surrogateescape") as f:
+            return [line.rstrip("\n") for line in f if line.strip()]
+    except OSError:
+        return []
+
+
+class Context:
+    def __init__(self, args):
+        self.rclone = args.rclone
+        self.local = os.path.abspath(args.local)
+        self.remote = args.remote
+        self.state = args.state_dir
+        self.log_path = args.log or os.path.join(self.state, "loudsync.log")
+        self.workdir = args.workdir or os.path.join(
+            os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+            "rclone", "bisync")
+        self.remote_name = self.remote.split(":", 1)[0]
+        self.dry_run = getattr(args, "dry_run", False)
+
+    def state_file(self, name):
+        return os.path.join(self.state, name)
+
+    def log(self, text):
+        if self.dry_run:
+            print(text)
+            return
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with open(self.log_path, "a", encoding="utf-8",
+                      errors="surrogateescape") as f:
+                f.write(f"{stamp} | {text}\n")
+        except OSError:
+            pass
+
+    def listing_path(self, side):
+        stem = session_name(self.local, self.remote)
+        return os.path.join(self.workdir, f"{stem}.{side}.lst")
+
+    def listing(self, side):
+        return read_listing(self.listing_path(side))
+
+    def run(self, *args, timeout=RCLONE_TIMEOUT):
+        return subprocess.run([self.rclone, *args], capture_output=True,
+                              text=True, timeout=timeout, errors="surrogateescape")
+
+    def remote_info(self):
+        """Backend type and modtime precision of the remote, cached for a day:
+        neither changes, and asking costs a process on every batch."""
+        cache_path = self.state_file("remote-info.json")
+        cache = read_json(cache_path, {})
+        entry = cache.get(self.remote)
+        if entry and time.time() - entry.get("at", 0) < REMOTE_INFO_MAX_AGE:
+            return entry
+        kind = ""
+        try:
+            res = self.run("listremotes", "--long", timeout=PROBE_TIMEOUT)
+            for line in res.stdout.splitlines():
+                m = re.match(r"^(\S+):\s+(\S+)\s*$", line)
+                if m and m.group(1) == self.remote_name:
+                    kind = m.group(2)
+            res = self.run("backend", "features", self.remote, timeout=PROBE_TIMEOUT)
+            precision_ns = int(json.loads(res.stdout).get("Precision", 0))
+        except (subprocess.SubprocessError, OSError, ValueError):
+            return None
+        if not kind or precision_ns <= 0:
+            return None
+        entry = {"type": kind, "precision_ms": max(1, -(-precision_ns // 1_000_000)),
+                 "at": int(time.time())}
+        cache[self.remote] = entry
+        write_json(cache_path, cache)
+        return entry
+
+
+# --- up ---------------------------------------------------------------------
+
+def decline(ctx, reason):
+    """Stand down, saying why once rather than on every batch."""
+    note = ctx.state_file("fast-lane-off")
+    try:
+        with open(note, encoding="utf-8") as f:
+            previous = f.read()
+    except OSError:
+        previous = ""
+    if previous != reason or ctx.dry_run:
+        ctx.log(f"FAST | standing down, the full pass takes over: {reason}")
+        if not ctx.dry_run:
+            with open(note, "w", encoding="utf-8") as f:
+                f.write(reason)
+    return UP_NEEDS_FULL
+
+
+def inside_git_repo(local, rel):
+    """True if any directory between the root and the file holds a .git."""
+    parts = rel.split("/")[:-1]
+    here = local
+    if os.path.lexists(os.path.join(here, ".git")):
+        return True
+    for part in parts:
+        here = os.path.join(here, part)
+        if os.path.lexists(os.path.join(here, ".git")):
+            return True
+    return False
+
+
+def remote_versions(ctx, rels):
+    """{path: (size, mtime_ms)} for the given paths as the remote has them
+    right now. Asked about one path at a time by rclone, no listing."""
+    fd, listfile = tempfile.mkstemp(dir=ctx.state, prefix=".fast-paths-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape") as f:
+            f.write("\n".join(rels) + "\n")
+        res = ctx.run("lsjson", "-R", "--files-only", "--no-traverse",
+                      "--no-mimetype", "--drive-skip-gdocs",
+                      "--files-from-raw", listfile, ctx.remote)
+    finally:
+        os.unlink(listfile)
+    if res.returncode != 0:
+        raise RuntimeError(res.stderr.strip()[-300:] or "lsjson failed")
+    found = {}
+    for item in json.loads(res.stdout or "[]"):
+        ms = to_ms(item.get("ModTime", ""))
+        if ms is not None and not item.get("IsDir"):
+            found[item["Path"]] = (int(item.get("Size", -1)), ms)
+    return found
+
+
+def cmd_up(ctx, args):
+    lock = open(ctx.state_file("loudsync.lock"), "a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return UP_BUSY
+
+    started = time.time()
+
+    # While the sync is failing or waiting on a decision, nothing clever.
+    if read_int(ctx.state_file("consecutive-failures")) > 0:
+        return decline(ctx, "the sync is currently failing")
+
+    # The generated filter file is only as good as the last full pass. If the
+    # hand-kept rules were edited since, it may be about to exclude things.
+    try:
+        with open(args.filters_base, "rb") as f:
+            base_md5 = hashlib.md5(f.read()).hexdigest()
+        with open(ctx.state_file("filters-base.md5"), encoding="utf-8") as f:
+            accepted_md5 = f.read().strip()
+    except OSError:
+        return decline(ctx, "no filter state from a completed full pass yet")
+    if base_md5 != accepted_md5 or not os.path.isfile(args.filters):
+        return decline(ctx, "the filter file changed since the last full pass")
+
+    listing1, listing2 = ctx.listing("path1"), ctx.listing("path2")
+    if listing1 is None or listing2 is None:
+        return decline(ctx, "no bisync listing to compare against (first run pending?)")
+    base1, dirs1 = listing1
+    base2, _dirs2 = listing2
+
+    info = ctx.remote_info()
+    if info is None:
+        return decline(ctx, "could not read the remote's capabilities")
+    tolerance = info["precision_ms"]
+    if tolerance > MAX_PRECISION_MS:
+        # Without usable modification times, "same size" is all that is left
+        # to tell two versions apart, and that is not evidence of anything.
+        return decline(ctx, "this remote does not keep modification times precisely enough")
+
+    def relative(path):
+        full = os.path.abspath(path)
+        if not full.startswith(ctx.local + os.sep):
+            return None
+        return full[len(ctx.local) + 1:]
+
+    needs_full = False
+    why_full = []
+
+    # Paths that went away. Only bisync deletes or renames on the remote, and
+    # it only needs to if the path ever got there.
+    gone = [relative(p) for p in read_lines(args.gone)]
+    changed = [relative(p) for p in read_lines(args.changed)]
+    candidates = {}
+    exact_ns = {}
+    for rel in changed:
+        if rel is None:
+            continue
+        full = os.path.join(ctx.local, rel)
+        if not os.path.lexists(full):
+            gone.append(rel)
+            continue
+        if os.path.islink(full) or not os.path.isfile(full):
+            continue
+        if rel.endswith(CONFLICT_SUFFIXES) or inside_git_repo(ctx.local, rel):
+            continue
+        try:
+            rel.encode("utf-8")
+        except UnicodeEncodeError:
+            continue    # not valid UTF-8: can't be written into a listing
+        st = os.stat(full)
+        candidates[rel] = (st.st_size, st.st_mtime_ns // 1_000_000)
+        exact_ns[rel] = st.st_mtime_ns
+
+    for rel in gone:
+        if rel is None or inside_git_repo(ctx.local, rel):
+            continue
+        if rel in base1 or rel in dirs1:
+            needs_full = True
+            why_full.append(f"{rel} was deleted or moved")
+
+    # Already what the remote holds, as far as anyone knows: nothing to send.
+    for rel in list(candidates):
+        if same_version(candidates[rel], base1.get(rel), 1):
+            del candidates[rel]
+
+    # Whether a file has stopped being written is the watcher's call: it only
+    # hands over paths that have been quiet for WATCH_DEBOUNCE seconds. A save
+    # that lands during the upload anyway is caught below, where what reached
+    # the remote is compared with what was meant to be sent.
+
+    if candidates and len(candidates) > args.max_files:
+        # A bulk change is exactly what a full pass is good at, and asking the
+        # remote about hundreds of paths one by one is slower than listing it.
+        ctx.log(f"FAST | {len(candidates)} files changed at once; "
+                "leaving the batch to the full pass.")
+        return UP_NEEDS_FULL
+
+    if candidates:
+        # The filter decision belongs to rclone and to the same file the full
+        # pass uses. A path it does not list is excluded: never uploaded.
+        try:
+            res = ctx.run("lsf", "-R", "--files-only", "--filter-from", args.filters,
+                          ctx.local)
+        except subprocess.SubprocessError:
+            return decline(ctx, "could not list the local folder through the filters")
+        if res.returncode != 0:
+            return decline(ctx, "could not list the local folder through the filters")
+        allowed = set(res.stdout.split("\n"))
+        candidates = {rel: v for rel, v in candidates.items() if rel in allowed}
+
+    uploaded = []
+    if candidates:
+        try:
+            remote_now = remote_versions(ctx, sorted(candidates))
+        except (RuntimeError, subprocess.SubprocessError, ValueError) as exc:
+            ctx.log(f"FAST | could not ask the remote about {len(candidates)} "
+                    f"file(s) ({str(exc).splitlines()[-1] if str(exc) else 'timeout'}); "
+                    "leaving them to the full pass.")
+            return UP_NEEDS_FULL
+
+        safe = []
+        for rel in sorted(candidates):
+            there = remote_now.get(rel)
+            if there is None:
+                # New here and absent there, with no history on either side.
+                ok = rel not in base1 and rel not in base2
+            else:
+                # The remote still holds the version the listing records.
+                # Nobody else has touched it.
+                ok = same_version(there, base2.get(rel), tolerance)
+            if ok:
+                safe.append(rel)
+            else:
+                needs_full = True
+                why_full.append(f"{rel} is not on the remote as last seen")
+
+        if safe and ctx.dry_run:
+            ctx.log(f"FAST | --dry-run, would upload {len(safe)} file(s): "
+                    + ", ".join(safe))
+        elif safe:
+            fd, listfile = tempfile.mkstemp(dir=ctx.state, prefix=".fast-up-")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8",
+                               errors="surrogateescape") as f:
+                    f.write("\n".join(safe) + "\n")
+                res = ctx.run("copy", ctx.local, ctx.remote,
+                              "--files-from-raw", listfile, "--no-traverse",
+                              "--drive-skip-gdocs",
+                              "--transfers", str(args.transfers),
+                              timeout=args.upload_timeout)
+            except subprocess.SubprocessError:
+                res = None
+            finally:
+                os.unlink(listfile)
+            if res is None or res.returncode != 0:
+                needs_full = True
+                detail = (res.stderr.strip().splitlines() or ["failed"])[-1] if res else "timed out"
+                why_full.append(f"the direct upload did not finish cleanly ({detail[-200:]})")
+
+            # Only what the remote demonstrably holds now goes into the
+            # listings, not what was meant to be sent.
+            try:
+                after = remote_versions(ctx, safe)
+            except (RuntimeError, subprocess.SubprocessError, ValueError):
+                after = {}
+            for rel in safe:
+                if same_version(after.get(rel), candidates[rel], tolerance):
+                    uploaded.append(rel)
+                else:
+                    # Saved again mid-upload, or the upload failed. The full
+                    # pass will compare the two copies for itself.
+                    needs_full = True
+                    why_full.append(f"{rel} could not be confirmed on the remote")
+
+            if uploaded:
+                files = {rel: (candidates[rel][0], exact_ns[rel]) for rel in uploaded}
+                parents = {}
+                for rel in uploaded:
+                    parent = os.path.dirname(rel)
+                    while parent:
+                        try:
+                            parents[parent] = os.stat(
+                                os.path.join(ctx.local, parent)).st_mtime_ns
+                        except OSError:
+                            pass
+                        parent = os.path.dirname(parent)
+                try:
+                    # Path2 first: if only one of the two gets written, a
+                    # listing that knows less than the truth is the harmless
+                    # way round (bisync finds both copies equal and moves on).
+                    record_in_listing(ctx.listing_path("path2"), files, parents)
+                    record_in_listing(ctx.listing_path("path1"), files, parents)
+                except (OSError, ValueError) as exc:
+                    needs_full = True
+                    why_full.append(f"could not record the upload in bisync's listings ({exc})")
+
+    if uploaded:
+        shown = ", ".join(uploaded[:3])
+        more = f" and {len(uploaded) - 3} more" if len(uploaded) > 3 else ""
+        ctx.log(f"FAST | uploaded {len(uploaded)} file(s) in "
+                f"{time.time() - started:.1f}s without a full pass: {shown}{more}")
+        with open(ctx.state_file("last-fast-upload"), "w", encoding="utf-8") as f:
+            f.write(str(int(time.time())))
+    if why_full:
+        shown = "; ".join(why_full[:3])
+        more = f"; and {len(why_full) - 3} more" if len(why_full) > 3 else ""
+        ctx.log(f"FAST | asking for a full pass: {shown}{more}")
+
+    if ctx.dry_run:
+        ctx.log("FAST | --dry-run, nothing was sent or recorded.")
+        return UP_NEEDS_FULL if needs_full else UP_OK
+    try:
+        os.unlink(ctx.state_file("fast-lane-off"))
+    except OSError:
+        pass
+    return UP_NEEDS_FULL if needs_full else UP_OK
+
+
+# --- probe ------------------------------------------------------------------
+
+def cmd_probe(ctx, _args):
+    info = ctx.remote_info()
+    if info is None:
+        return PROBE_ERROR
+    # Only Google Drive answers "what changed since" in one call through
+    # rclone today. Every other backend keeps the timed full passes.
+    if info["type"] != "drive":
+        return PROBE_UNSUPPORTED
+
+    last_start = read_int(ctx.state_file("last-run-start"))
+    if last_start <= 0:
+        return PROBE_UNSUPPORTED
+    listing2 = ctx.listing("path2")
+    if listing2 is None:
+        return PROBE_UNSUPPORTED
+    base2, _dirs = listing2
+
+    since = time.strftime("%Y-%m-%dT%H:%M:%S",
+                          time.gmtime(last_start - PROBE_MARGIN_SECONDS))
+    # Native Google documents are skipped by the sync (--drive-skip-gdocs),
+    # and their mime types share a prefix with folders, which carry no content.
+    query = (f"(modifiedTime > '{since}' or createdTime > '{since}') "
+             "and trashed = false "
+             "and not mimeType contains 'application/vnd.google-apps'")
+    try:
+        res = ctx.run("backend", "query", f"{ctx.remote_name}:", query,
+                      timeout=PROBE_TIMEOUT)
+        if res.returncode != 0:
+            return PROBE_ERROR
+        # rclone prints "null", not "[]", when the query matches nothing.
+        hits = json.loads(res.stdout or "[]") or []
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return PROBE_ERROR
+
+    # Everything the sync itself knows about, by name, size and time: what
+    # the last full pass listed, plus what the fast lane recorded since.
+    known = set()
+    for rel, (size, ms) in base2.items():
+        known.add((os.path.basename(rel), size, ms))
+
+    seen_path = ctx.state_file("probe-seen.json")
+    seen = read_json(seen_path, {})
+    now = int(time.time())
+    fresh = {}
+    unexplained = 0
+    for hit in hits:
+        file_id = hit.get("id", "")
+        modified = hit.get("modifiedTime", "")
+        ms = to_ms(modified)
+        try:
+            size = int(hit.get("size", -1))
+        except (TypeError, ValueError):
+            size = -1
+        if ms is not None and any((hit.get("name"), size, ms + d) in known
+                                  for d in (-1, 0, 1)):
+            continue
+        # A change outside the synced folder matches nothing above and never
+        # will. Once a full pass has run since it was first noticed, it has
+        # been looked at; don't keep running passes over it.
+        mark = seen.get(file_id)
+        if mark and mark.get("m") == modified:
+            fresh[file_id] = mark
+            if last_start > mark.get("at", now):
+                continue
+        else:
+            fresh[file_id] = {"m": modified, "at": now}
+        unexplained += 1
+
+    if fresh != seen:
+        write_json(seen_path, fresh)
+    return PROBE_CHANGED if unexplained else PROBE_NOTHING
+
+
+# --- main -------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("command", choices=("up", "probe"))
+    ap.add_argument("rclone")
+    ap.add_argument("local")
+    ap.add_argument("remote")
+    ap.add_argument("--state-dir", required=True)
+    ap.add_argument("--filters", help="the generated filter file")
+    ap.add_argument("--filters-base", help="the hand-kept filter file")
+    ap.add_argument("--changed", help="file listing paths that were written")
+    ap.add_argument("--gone", help="file listing paths that were deleted or moved away")
+    ap.add_argument("--log")
+    ap.add_argument("--workdir", help="bisync's working directory")
+    ap.add_argument("--transfers", type=int, default=8)
+    ap.add_argument("--max-files", type=int, default=25)
+    ap.add_argument("--upload-timeout", type=int, default=1800)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="up: say what would be uploaded and why, send nothing")
+    args = ap.parse_args()
+
+    if args.command == "up" and not (args.filters and args.filters_base):
+        ap.error("up needs --filters and --filters-base")
+    ctx = Context(args)
+    # Whatever goes wrong in here, the answer is the cautious one: the probe
+    # has no information, and the batch goes to the full pass.
+    try:
+        os.makedirs(ctx.state, exist_ok=True)
+        if args.command == "probe":
+            return cmd_probe(ctx, args)
+        return cmd_up(ctx, args)
+    except Exception as exc:  # noqa: BLE001
+        ctx.log(f"FAST | {args.command} failed unexpectedly "
+                f"({type(exc).__name__}: {exc}); the full pass takes over.")
+        return PROBE_ERROR if args.command == "probe" else UP_NEEDS_FULL
+
+
+if __name__ == "__main__":
+    sys.exit(main())

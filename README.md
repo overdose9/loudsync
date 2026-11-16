@@ -104,9 +104,10 @@ while you are typing.
 
 ## Status
 
-**v0.4.0 — early.** Daily-driven by the author on Linux Mint against Google
-Drive, roughly 800 files. It has not been tested at large scale, across many
-providers, or by anyone else yet.
+**v0.5.0 — early.** Daily-driven by the author on Linux Mint against Google
+Drive, roughly 7,000 files in 2,300 folders. It has not been tested at large
+scale, across many providers, or by anyone else yet. The fast lane and the
+remote probe are new in this version; the probe is Google Drive only.
 
 This tool moves your data in both directions. Read what the safety brakes do
 before you point it at something irreplaceable, and keep a backup that isn't
@@ -119,7 +120,7 @@ this.
 | `rclone` | required — a single binary, a user-space install is fine |
 | `bash`, `python3` | required |
 | `systemd` (user session) | required for the automation |
-| `inotify-tools` | optional — without it, uploads wait for the timer |
+| `inotify-tools` | optional — without it, a file you save waits for the next full pass instead of uploading in seconds |
 | `notify-send` | optional — no desktop alerts without it |
 | GTK 3 for Python (`python3-gi`, `gir1.2-gtk-3.0`) | optional — the tray icon and window |
 | XApp or AyatanaAppIndicator introspection | optional — the tray icon itself; without either, the window alone |
@@ -171,7 +172,8 @@ separately and merged in automatically, so never list a repo there.
 ## Use
 
 ```sh
-loudsync                     # one run (this is what systemd calls)
+loudsync                     # one full pass, now
+loudsync --if-needed         # a full pass only if there is a reason (what systemd calls)
 loudsync --status            # where things stand, and any conflict left to settle
 loudsync --dry-run           # show what would happen, change nothing
 loudsync --now               # don't wait for the folder to go quiet
@@ -209,19 +211,67 @@ exactly the same, because that runs under systemd, not inside the window.
 
 ## How it works
 
-Two triggers, because they solve different halves of the problem:
+The engine is `rclone bisync`, and a bisync pass has one cost that dwarfs the
+rest: before moving a byte it lists both sides from top to bottom. Against a
+cloud provider that listing takes about a minute for the author's 19,000
+remote entries, whether one file changed or none did. Run it every minute
+regardless and a file you just saved waits behind a pass that was busy
+learning nothing had changed.
 
-- **A watcher** (`inotify`) fires a few seconds after you change a local file,
-  which is what makes uploads feel instant. Bursts are debounced, so saving 20
-  files is one sync.
-- **A one-minute timer** pulls changes down from the remote. Most providers
-  don't notify third-party clients, so the only way to know is to ask.
+So the full pass only runs when there is a reason for one, and the two cases
+that make up nearly all of a normal day don't need it at all:
 
-Both run through the same lock, so they can never overlap. The timer is
-`Persistent=true`: if the machine was off, it syncs on boot rather than waiting
-for its turn.
+- **The fast lane: a file you save is uploaded directly.** The watcher
+  (`inotify`) notices the save, waits `WATCH_DEBOUNCE` seconds for that file to
+  go quiet, and hands it over. The fast lane asks the remote about that one
+  path, and uploads only if the remote still holds exactly the version
+  bisync's listing records. It then writes the upload into that listing, the
+  same entry bisync would have written, so the next full pass sees a file
+  already in sync rather than one that changed on both sides. No listing of
+  the remote, so it takes seconds. Each file waits on its own clock: something
+  writing nonstop next to your document doesn't hold the document back.
+- **The probe: one cheap query instead of a listing.** Every
+  `REMOTE_POLL_SECONDS` (15 by default) the watcher asks the remote "what
+  changed since the last full pass started?". That is a single request. Files
+  the sync already knows about are discounted, and anything left over starts a
+  full pass to pull it down. Google Drive only, for now; any other backend
+  gets a full pass a minute, as before.
 
-Under the hood it's `rclone bisync` with conflict resolution set to
+Everything else is a full pass, on purpose. **The fast lane only ever copies a
+local file up.** It never deletes, renames, downloads or picks a winner. A
+deletion, a rename, a folder moved in whole, more than `FAST_MAX_FILES` files
+at once, a file the remote changed too: each of those becomes a request for a
+full pass, which is where conflicts get detected and announced. When the fast
+lane can't prove an upload is safe it stands down and says why
+(`loudsync --status` shows it). Declining costs a minute; guessing could cost
+a version of your work.
+
+Two things it will not upload under any circumstances, because the filters
+are the point of this tool: a path rclone doesn't list through the same
+generated filter file the full pass uses, and anything under a directory that
+holds a `.git`, even a repo cloned ten seconds ago that no filter knows about
+yet.
+
+A full pass also still happens at least every `FULL_SYNC_SECONDS` (300 by
+default). The probe doesn't see everything: a file deleted or renamed on the
+remote, or uploaded from a machine that was offline when it was edited, only
+shows up in a listing. That interval is the bound on how long those wait.
+
+A one-minute timer sits under all of it as the safety net. Each tick runs
+`loudsync --if-needed`, which syncs if the watcher asked, if the last attempt
+failed, if the probe found something or if the interval is up, and otherwise
+exits without a word. If the watcher dies or `inotify-tools` isn't installed,
+syncing degrades to that timer; it doesn't stop. Everything runs through one
+lock, so nothing overlaps. The timer is `Persistent=true`: if the machine was
+off, it syncs on boot rather than waiting for its turn.
+
+What to expect, measured on the author's Drive: asking about one file takes
+about 2.5 seconds, the probe under one, and a full pass 20 to 50 seconds
+with `FAST_LIST=1` (it was close to four minutes without). A saved file was
+on the remote 13 to 33 seconds later, and a file created on the remote
+arrived here in 31.
+
+Under the hood the full pass is `rclone bisync` with conflict resolution set to
 newest-wins. The loser is kept alongside the winner with a `.conflict-local` or
 `.conflict-remote` suffix rather than being thrown away, and you get told about
 it.
@@ -281,6 +331,10 @@ on the other side.
 ## What it deliberately does not do
 
 - **No one-way / backup-only mode.** It's a two-way sync.
+- **No fast lane for anything but uploading a file.** Downloads, deletions and
+  renames go through a full pass. Applying those without a listing means
+  trusting a change feed over what is actually there, and the cases where the
+  two disagree are the ones that lose data.
 - **No remote-side versioning.** Your provider already does that; duplicating
   it burns quota and grows a dated folder nobody prunes.
 - **No blind resync when a path disappears.** The rename gets propagated to the
@@ -326,9 +380,22 @@ at all (a database, a log, a cache), exclude it in `filters-base.txt`; the
 exclusion also stops it from postponing runs. `QUIET_SECONDS=0` disables the
 wait entirely.
 
-**Nothing is being uploaded within seconds** — the watcher likely isn't
-running, or `inotify-tools` isn't installed. Check with
-`systemctl --user status loudsync-watch.service`.
+**Nothing is being uploaded within seconds** — check three things. The watcher
+may not be running, or `inotify-tools` isn't installed:
+`systemctl --user status loudsync-watch.service`. The fast lane may be
+standing down, in which case `loudsync --status` has a `fast lane:` line that
+says why (the sync is failing, the filter file was edited since the last full
+pass, or the remote doesn't keep modification times precisely enough). Or the
+remote is reached through an `alias` or `union` remote: bisync names its
+state after the target, the fast lane can't find it, and it stands down. Point
+`REMOTE` at the underlying remote instead. To see what it would do with a
+file, without sending anything:
+`loudsync-fast up <rclone> <local> <remote> --state-dir ~/.local/state/loudsync --filters ~/.local/state/loudsync/filters-generated.txt --filters-base ~/.config/loudsync/filters-base.txt --changed <file listing paths> --dry-run`.
+
+**A change made elsewhere takes minutes to arrive** — the probe only knows
+Google Drive, and only sees files created or modified since the last full
+pass. Anything else waits for `FULL_SYNC_SECONDS`. Lower it if that matters
+more to you than the API calls a full listing costs.
 
 **Something isn't syncing at all** — check whether a filter catches it before
 suspecting the sync: `grep -n <name> ~/.config/loudsync/filters-base.txt`, and

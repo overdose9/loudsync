@@ -6,7 +6,10 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=@BINDIR@/loudsync
+# --if-needed: a full pass only when there is a reason for one (a request
+# from the watcher, a change on the remote, a failure to retry, or
+# FULL_SYNC_SECONDS gone by). The rest of the ticks cost one cheap query.
+ExecStart=@BINDIR@/loudsync --if-needed
 # Low priority: syncing must never fight with whatever you are doing.
 Nice=10
 IOSchedulingClass=idle

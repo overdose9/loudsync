@@ -260,6 +260,44 @@ class SmallTests(unittest.TestCase):
             self.assertEqual(core.count_repos(d), 2)
 
 
+class VersionTests(Sandbox):
+    """What the About box shows is read from what is installed."""
+
+    def sandboxed_engine(self):
+        """Paths whose engine lives inside the throwaway home. Paths.from_env
+        finds the engine wherever it is really installed, fake HOME or not,
+        so writing to self.paths.engine would overwrite the installed one.
+        It did, once (16-11-2026)."""
+        paths = core.Paths.from_env({"HOME": self.home,
+                                     "LOUDSYNC_ENGINE_DIR": os.path.join(self.home, "bin")})
+        self.assertTrue(paths.engine.startswith(self.home + os.sep))
+        return paths
+
+    def test_engine_version_comes_from_the_installed_engine(self):
+        paths = self.sandboxed_engine()
+        os.makedirs(os.path.dirname(paths.engine))
+        with open(paths.engine, "w", encoding="utf-8") as f:
+            f.write('#!/usr/bin/env bash\nVERSION="9.8.7"\n')
+        self.assertEqual(core.engine_version(paths), "9.8.7")
+
+    def test_engine_version_is_empty_when_there_is_no_engine(self):
+        self.assertEqual(core.engine_version(self.sandboxed_engine()), "")
+
+    def test_rclone_version_is_read_from_the_binary(self):
+        fake = os.path.join(self.home, "rclone")
+        with open(fake, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\necho 'rclone v1.2.3'\necho '- os/version: test'\n")
+        os.chmod(fake, 0o755)
+        cfg = core.read_config(self.paths)
+        cfg.values["RCLONE_BIN"] = fake
+        self.assertEqual(core.rclone_version(cfg, self.home), "v1.2.3")
+
+    def test_rclone_version_is_empty_when_it_does_not_answer(self):
+        cfg = core.read_config(self.paths)
+        cfg.values["RCLONE_BIN"] = os.path.join(self.home, "no-such-rclone")
+        self.assertEqual(core.rclone_version(cfg, self.home), "")
+
+
 if __name__ == "__main__":
     unittest.main()
 

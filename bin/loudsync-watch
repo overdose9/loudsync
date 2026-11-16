@@ -1,12 +1,24 @@
 #!/usr/bin/env bash
 #
-# Watches the local folder and triggers a sync a few seconds after any change.
+# The part of loudsync that makes it feel instant. It does two jobs, and stays
+# running to do them:
 #
-# This is what makes uploads feel instant. Downloads still depend on the timer,
-# because most providers don't notify third-party clients about remote changes.
+#   1. Watches the local folder. A file you saved is handed to the fast lane
+#      (loudsync-fast up), which uploads it directly in a few seconds instead
+#      of waiting for a pass over everything. What the fast lane will not send
+#      on its own — a deletion, a rename, a bulk change, a file the remote
+#      changed too — becomes a request for a full pass.
 #
-# Needs inotify-tools. Without it the timer alone still covers both directions,
-# just with more latency on the way up.
+#   2. Asks the remote, every REMOTE_POLL_SECONDS, whether anything changed
+#      there (loudsync-fast probe: one cheap query). Most providers don't
+#      notify third-party clients, so the only way to know is to ask; asking
+#      cheaply is what lets it ask often. A change starts a full pass.
+#
+# It never syncs anything itself beyond calling those two. Deleting, renaming,
+# pulling down and resolving conflicts all stay in loudsync, behind its lock.
+#
+# Needs inotify-tools for the first job. Without it the remote is still polled
+# and the timer still covers both directions, with more latency on the way up.
 #
 # Copyright (C) 2026 Sebastián Flores
 # Licensed under the GNU General Public License v3.0 or later.
@@ -14,10 +26,18 @@
 set -euo pipefail
 
 CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}/loudsync"
+STATE_HOME="${XDG_STATE_HOME:-${HOME}/.local/state}/loudsync"
 CONFIG_FILE="${LOUDSYNC_CONFIG:-${CONFIG_HOME}/loudsync.conf}"
 
 LOCAL_DIR=""
-WATCH_DEBOUNCE=5   # seconds to group bursts (saving 20 files = one sync)
+REMOTE=""
+RCLONE_BIN=""
+FILTERS_BASE="${CONFIG_HOME}/filters-base.txt"
+WATCH_DEBOUNCE=5        # seconds a file must stay untouched before it is sent
+REMOTE_POLL_SECONDS=15  # how often to ask the remote whether anything changed
+FAST_LANE=1             # 0: every local change waits for a full pass
+FAST_MAX_FILES=25       # more files than this at once go to the full pass
+TRANSFERS=8
 SYNC_UNIT="loudsync.service"
 
 if [ -f "${CONFIG_FILE}" ]; then
@@ -29,25 +49,216 @@ else
 fi
 
 LOCAL_DIR="${LOCAL_DIR/#\~/${HOME}}"
+LOCAL_DIR="${LOCAL_DIR%/}"
 [ -d "${LOCAL_DIR}" ] || { echo "loudsync-watch: no such folder: ${LOCAL_DIR}" >&2; exit 1; }
 
-command -v inotifywait >/dev/null 2>&1 || {
-    echo "inotifywait not found. Install inotify-tools." >&2
-    exit 1
-}
+if [ -z "${RCLONE_BIN}" ]; then
+    for candidate in "${HOME}/.local/bin/rclone" /usr/bin/rclone /usr/local/bin/rclone; do
+        [ -x "${candidate}" ] && { RCLONE_BIN="${candidate}"; break; }
+    done
+    [ -z "${RCLONE_BIN}" ] && RCLONE_BIN="$(command -v rclone || true)"
+fi
 
-# Noise not worth waking the sync for. These are the same paths the filters
+mkdir -p "${STATE_HOME}"
+chmod 700 "${STATE_HOME}" 2>/dev/null || true
+FILTERS="${STATE_HOME}/filters-generated.txt"
+LOG="${STATE_HOME}/loudsync.log"
+SYNC_REQUESTED="${STATE_HOME}/sync-requested"
+FAST_HELPER="$(dirname "$(readlink -f "$0")")/loudsync-fast"
+
+HAVE_FAST=0
+if [ "${FAST_LANE}" -eq 1 ] && [ -f "${FAST_HELPER}" ] && [ -n "${RCLONE_BIN}" ] \
+   && command -v python3 >/dev/null 2>&1; then
+    HAVE_FAST=1
+fi
+
+# Noise not worth waking anything for. These are the same paths the filters
 # exclude, so a change inside them would produce an empty run anyway.
 IGNORE='(/\.git/|/\.claude/|/node_modules/|/\.venv/|/venv/|/__pycache__/|/dist/|/\.astro/|/\.pytest_cache/|/\.mypy_cache/|/\.ruff_cache/|\.swp$|\.tmp$|~$)'
 
+# More pending paths than this is a bulk change (an unpacked archive, a moved
+# tree). That is a full pass's job, and tracking it file by file here would
+# only delay it.
+MAX_PENDING=500
+
+# Ask for a full pass. The marker is what makes the request stick: starting a
+# unit that is already running is a no-op, so without it a change landing in
+# the middle of a pass would wait for the next timed one. loudsync removes the
+# marker when a pass starts, and poll() below starts the unit again for as
+# long as it exists.
+request_full() {
+    : >"${SYNC_REQUESTED}"
+    systemctl --user start --no-block "${SYNC_UNIT}" 2>/dev/null || true
+}
+
+# path -> "c <second>" (written) or "g <second>" (deleted or moved away),
+# the second being that of its last event. One table and no unset: removing
+# an entry whose subscript is a file name somebody else chose is where bash
+# gets subtle, so entries are only ever assigned, and flush() rebuilds the
+# table from the ones it keeps.
+declare -A PENDING=()
+FULL_WANTED=0           # something happened that only a full pass handles
+RETRY_AT=0              # a sync held the lock; don't hammer it
+
+handle_event() {
+    local events="${1%%|*}" path="${1#*|}" now="$2"
+    case ",${events}," in
+        *,ISDIR,*)
+            case ",${events}," in
+                # A directory that arrives whole brings files no event will
+                # ever name.
+                *,MOVED_TO,*) FULL_WANTED=1 ;;
+                *,DELETE,*|*,MOVED_FROM,*) PENDING["${path}"]="g ${now}" ;;
+                # A new, empty directory: the files put in it announce
+                # themselves.
+            esac ;;
+        *,DELETE,*|*,MOVED_FROM,*) PENDING["${path}"]="g ${now}" ;;
+        *)                         PENDING["${path}"]="c ${now}" ;;
+    esac
+}
+
+# Hands over every path that has been quiet for WATCH_DEBOUNCE seconds. Each
+# file waits on its own clock, so one that is written to constantly cannot
+# hold back the document you just saved next to it.
+flush() {
+    local now="$1" path entry kind since rc tmp_changed tmp_gone
+    local ripe_changed=() ripe_gone=()
+    local -A keep=()
+
+    if [ "${#PENDING[@]}" -gt "${MAX_PENDING}" ]; then
+        PENDING=(); FULL_WANTED=1
+    fi
+    if [ "${FULL_WANTED}" -eq 1 ]; then
+        FULL_WANTED=0
+        request_full
+    fi
+    [ "${#PENDING[@]}" -gt 0 ] || return 0
+    [ "${now}" -ge "${RETRY_AT}" ] || return 0
+
+    for path in "${!PENDING[@]}"; do
+        entry="${PENDING[${path}]}"
+        kind="${entry%% *}"
+        since="${entry##* }"
+        if [ $(( now - since )) -lt "${WATCH_DEBOUNCE}" ]; then
+            keep["${path}"]="${entry}"
+        elif [ "${kind}" = "g" ]; then
+            ripe_gone+=("${path}")
+        else
+            ripe_changed+=("${path}")
+        fi
+    done
+    [ $(( ${#ripe_changed[@]} + ${#ripe_gone[@]} )) -gt 0 ] || return 0
+
+    rc=10
+    if [ "${HAVE_FAST}" -eq 1 ]; then
+        tmp_changed="$(mktemp "${STATE_HOME}/.watch-changed-XXXXXX")"
+        tmp_gone="$(mktemp "${STATE_HOME}/.watch-gone-XXXXXX")"
+        if [ ${#ripe_changed[@]} -gt 0 ]; then printf '%s\n' "${ripe_changed[@]}" >"${tmp_changed}"; fi
+        if [ ${#ripe_gone[@]} -gt 0 ]; then printf '%s\n' "${ripe_gone[@]}" >"${tmp_gone}"; fi
+        set +e
+        python3 "${FAST_HELPER}" up "${RCLONE_BIN}" "${LOCAL_DIR}" "${REMOTE}" \
+            --state-dir "${STATE_HOME}" --log "${LOG}" \
+            --filters "${FILTERS}" --filters-base "${FILTERS_BASE}" \
+            --changed "${tmp_changed}" --gone "${tmp_gone}" \
+            --transfers "${TRANSFERS}" --max-files "${FAST_MAX_FILES}" \
+            >/dev/null 2>&1
+        rc=$?
+        set -e
+        rm -f "${tmp_changed}" "${tmp_gone}"
+    fi
+
+    if [ "${rc}" -eq 11 ]; then
+        # A pass is running. It may already be carrying these very files (it
+        # is also what wrote them, when it is pulling changes down), so keep
+        # the batch and look again once it is done.
+        RETRY_AT=$(( now + 5 ))
+        return 0
+    fi
+
+    # Only what was not handed over stays.
+    PENDING=()
+    for path in "${!keep[@]}"; do
+        PENDING["${path}"]="${keep[${path}]}"
+    done
+    if [ "${rc}" -ne 0 ]; then
+        request_full
+    fi
+}
+
+poll() {
+    local rc
+    if [ -e "${SYNC_REQUESTED}" ]; then
+        systemctl --user start --no-block "${SYNC_UNIT}" 2>/dev/null || true
+        return 0
+    fi
+    [ "${HAVE_FAST}" -eq 1 ] || return 0
+    set +e
+    python3 "${FAST_HELPER}" probe "${RCLONE_BIN}" "${LOCAL_DIR}" "${REMOTE}" \
+        --state-dir "${STATE_HOME}" --log "${LOG}" >/dev/null 2>&1
+    rc=$?
+    set -e
+    # Only a positive answer starts anything from here. A remote that can't
+    # be probed, or one that can't be reached, is the timer's business.
+    if [ "${rc}" -eq 0 ]; then
+        request_full
+    fi
+}
+
+HAVE_WATCH=0
+if command -v inotifywait >/dev/null 2>&1; then
+    HAVE_WATCH=1
+    # Monitor mode: the watches are set up once and stay. Setting them up
+    # again after every change, on a tree of tens of thousands of folders,
+    # costs seconds each time during which nothing is being watched.
+    exec 3< <(exec inotifywait -m -r -q \
+        -e modify,close_write,create,delete,move \
+        --format '%e|%w%f' --exclude "${IGNORE}" "${LOCAL_DIR}" 2>/dev/null)
+else
+    echo "loudsync-watch: inotifywait not found (install inotify-tools);" \
+         "polling the remote only, local changes wait for the timer." >&2
+fi
+
+NEXT_POLL=0
 while true; do
-    # Blocks until something relevant happens.
-    inotifywait -r -q -e modify,create,delete,move \
-        --exclude "${IGNORE}" "${LOCAL_DIR}" >/dev/null 2>&1 || true
+    printf -v NOW '%(%s)T' -1
 
-    sleep "${WATCH_DEBOUNCE}"
+    # Sleep until the next thing that is due: a pending path going quiet, or
+    # the next poll.
+    WAIT=$(( NEXT_POLL - NOW ))
+    if [ "${#PENDING[@]}" -gt 0 ] || [ "${FULL_WANTED}" -eq 1 ]; then
+        WAIT=1
+    fi
+    if [ "${WAIT}" -lt 1 ]; then WAIT=1; fi
 
-    # start, not restart: if a sync is already running, systemd queues this one
-    # instead of killing it halfway through.
-    systemctl --user start "${SYNC_UNIT}" || true
+    if [ "${HAVE_WATCH}" -eq 1 ]; then
+        set +e
+        IFS= read -r -t "${WAIT}" -u 3 LINE
+        RC=$?
+        set -e
+        printf -v NOW '%(%s)T' -1
+        if [ "${RC}" -eq 0 ]; then
+            handle_event "${LINE}" "${NOW}"
+            # Drain what is already queued before doing anything slow, so a
+            # burst is read as a burst.
+            while IFS= read -r -t 0.05 -u 3 LINE; do
+                handle_event "${LINE}" "${NOW}"
+            done
+        elif [ "${RC}" -le 128 ]; then
+            # Not a timeout: inotifywait is gone. Exit and let systemd start
+            # a fresh one rather than run on, blind.
+            echo "loudsync-watch: inotifywait stopped; restarting." >&2
+            exit 1
+        fi
+    else
+        sleep "${WAIT}"
+        printf -v NOW '%(%s)T' -1
+    fi
+
+    flush "${NOW}"
+
+    if [ "${NOW}" -ge "${NEXT_POLL}" ]; then
+        poll
+        printf -v NOW '%(%s)T' -1
+        NEXT_POLL=$(( NOW + REMOTE_POLL_SECONDS ))
+    fi
 done

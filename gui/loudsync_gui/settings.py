@@ -126,7 +126,7 @@ class SettingsPage:
         self.auto_switch = Gtk.Switch()
         self.auto_switch.connect("notify::active", self._on_automation)
         rows.add(widgets.row(_("Sync automatically"),
-                             _("Uploads within seconds, checks the cloud every minute."),
+                             _("Uploads within seconds, checks the cloud every few seconds."),
                              self.auto_switch))
         box.pack_start(frame, False, False, 0)
 

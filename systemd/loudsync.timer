@@ -1,11 +1,12 @@
 [Unit]
-Description=Check the remote for changes every minute
+Description=loudsync safety net: check every minute whether a full pass is due
 Documentation=https://github.com/overdose9/loudsync
 
 [Timer]
-# Most providers don't notify third-party clients, so pulling changes down
-# means asking. One minute is the balance between latency and API quota.
-# Local changes don't wait for this: the watcher triggers them in seconds.
+# The watcher is what makes syncing fast: it uploads what you save and asks
+# the remote for changes every few seconds. This timer is what makes it
+# dependable: if the watcher is not running, or missed something, a pass
+# still happens. Each tick runs "loudsync --if-needed", which decides.
 OnBootSec=2min
 OnUnitInactiveSec=1min
 AccuracySec=10s

@@ -48,7 +48,7 @@ if [ "${1:-}" = "--uninstall" ]; then
     done
     systemctl --user daemon-reload
     rm -f "${BINDIR}/loudsync" "${BINDIR}/loudsync-watch" "${BINDIR}/loudsync-rename" \
-          "${BINDIR}/loudsync-gui"
+          "${BINDIR}/loudsync-fast" "${BINDIR}/loudsync-gui"
     say "removed binaries from ${BINDIR}"
     rm -rf "${SHAREDIR}"
     rm -f "${APPDIR}/loudsync.desktop" "${ICONDIR}"/loudsync.svg "${ICONDIR}"/loudsync-*.svg "${AUTOSTART}"
@@ -79,7 +79,7 @@ fi
 if command -v python3 >/dev/null 2>&1; then
     say "python3: found"
 else
-    say "python3: MISSING — needed by --propagate-rename"
+    say "python3: MISSING — needed by the fast lane and by --propagate-rename"
     MISSING=1
 fi
 
@@ -87,8 +87,8 @@ if command -v inotifywait >/dev/null 2>&1; then
     say "inotify-tools: found"
 else
     say "inotify-tools: not found (optional)"
-    say "        Without it, local changes wait for the one-minute timer"
-    say "        instead of syncing within seconds. Install with your package"
+    say "        Without it, a file you save waits for the next full pass"
+    say "        instead of uploading within seconds. Install with your package"
     say "        manager, e.g. apt install inotify-tools"
 fi
 
@@ -121,7 +121,7 @@ head_ "Installing"
 
 mkdir -p "${BINDIR}" "${CONFIG_HOME}" "${STATE_HOME}" "${UNITDIR}"
 
-for f in loudsync loudsync-watch loudsync-rename loudsync-gui; do
+for f in loudsync loudsync-watch loudsync-rename loudsync-fast loudsync-gui; do
     install -m 755 "${SRC}/bin/${f}" "${BINDIR}/${f}"
     say "${BINDIR}/${f}"
 done
@@ -215,7 +215,7 @@ if [ "${NEW_CONFIG}" -eq 1 ]; then
     say "     systemctl --user enable --now loudsync.timer loudsync-watch.service"
 else
     say "Upgraded. Restart the services to pick up the new version:"
-    say "  systemctl --user restart loudsync-watch.service"
+    say "  systemctl --user restart loudsync.timer loudsync-watch.service"
 fi
 
 echo

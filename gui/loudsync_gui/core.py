@@ -898,6 +898,20 @@ def engine_version(paths):
     return m.group(1) if m else ""
 
 
+def rclone_version(config, home):
+    """'v1.74.4', as the rclone this install would run reports it. Empty if
+    it is missing or doesn't answer: the About box says so rather than guess."""
+    binary = find_rclone(config, home)
+    if not binary:
+        return ""
+    try:
+        res = subprocess.run([binary, "version"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    m = re.search(r"^rclone\s+(v\S+)", res.stdout, re.MULTILINE)
+    return m.group(1) if m else ""
+
+
 # --- Files that ship with loudsync -------------------------------------------
 
 

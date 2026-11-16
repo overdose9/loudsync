@@ -104,6 +104,7 @@ class Tray:
 
         self.conflicts_item = self._item("", lambda: app.show_window("conflicts"))
         self.menu.append(Gtk.SeparatorMenuItem())
+        self._item(_("About loudsync"), app.show_about)
         self._item(_("Quit (syncing keeps running)"), app.quit_tray)
         self.menu.show_all()
         return self.menu

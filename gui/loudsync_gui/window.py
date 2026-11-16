@@ -274,6 +274,11 @@ class MainWindow(Gtk.ApplicationWindow):
 
         header = Gtk.HeaderBar(title="loudsync", show_close_button=True)
         self.spinner = Gtk.Spinner()
+        about = Gtk.Button.new_from_icon_name("help-about-symbolic", Gtk.IconSize.BUTTON)
+        about.set_tooltip_text(_("About loudsync"))
+        about.set_relief(Gtk.ReliefStyle.NONE)
+        about.connect("clicked", lambda _b: app.show_about())
+        header.pack_end(about)
         header.pack_end(self.spinner)
         self.set_titlebar(header)
 

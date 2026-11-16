@@ -74,6 +74,9 @@ class LoudsyncApp(Gtk.Application):
             self.show_window()
         return 0
 
+    def show_about(self):
+        dialogs.about(self, self.window)
+
     def quit_tray(self):
         if self.window is not None:
             self.window.destroy()

@@ -24,6 +24,40 @@ TERMINALS = (
 )
 
 
+WEBSITE = "https://github.com/overdose9/loudsync"
+
+
+def about(app, parent=None):
+    """Which loudsync this is. The version is read from the installed engine,
+    the thing that actually moves the files, not from this window's own code:
+    after a half-finished upgrade the two can differ, and the engine is the
+    one a bug report needs."""
+    paths = app.paths
+    version = core.engine_version(paths) or _("unknown")
+    rclone = core.rclone_version(app.config, paths.home)
+    facts = [
+        _("Sync engine: {path}").format(path=paths.engine),
+        (_("rclone: {version}").format(version=rclone) if rclone
+         else _("rclone: not found")),
+        _("Settings: {path}").format(path=paths.config_file),
+        _("Log: {path}").format(path=paths.log),
+    ]
+    dialog = Gtk.AboutDialog(transient_for=parent, modal=parent is not None)
+    dialog.set_program_name("loudsync")
+    dialog.set_version(version)
+    dialog.set_logo_icon_name("loudsync")
+    dialog.set_comments(
+        _("Two-way folder sync that knows what a git repo is, refuses to upload "
+          "your secrets, and shouts when it breaks.") + "\n\n" + "\n".join(facts))
+    dialog.set_website(WEBSITE)
+    dialog.set_website_label(_("Source code and issues"))
+    dialog.set_copyright("Copyright © 2026 Sebastián Flores")
+    dialog.set_license_type(Gtk.License.GPL_3_0)
+    dialog.connect("response", lambda d, _r: d.destroy())
+    dialog.present()
+    return dialog
+
+
 def open_terminal(argv):
     for binary, build in TERMINALS:
         if shutil.which(binary):

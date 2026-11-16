@@ -1,5 +1,5 @@
 [Unit]
-Description=loudsync watcher — triggers a sync when local files change
+Description=loudsync watcher — uploads what you save and polls the remote for changes
 Documentation=https://github.com/overdose9/loudsync
 After=network-online.target
 

@@ -17,7 +17,9 @@
 #      conflicts: rclone resolves them, exits 0, and tells nobody.
 #
 # Usage:
-#   loudsync                    normal run (this is what systemd calls)
+#   loudsync                    one full pass
+#   loudsync --if-needed        a full pass only if there is a reason for one
+#                               (this is what systemd calls)
 #   loudsync --resync           first run, or to rebuild sync state
 #   loudsync --dry-run          show what would happen, change nothing
 #   loudsync --propagate-rename you renamed a folder containing a git repo
@@ -31,7 +33,7 @@
 
 set -euo pipefail
 
-VERSION="0.4.1"
+VERSION="0.5.0"
 
 # --- Configuration ----------------------------------------------------------
 #
@@ -60,6 +62,8 @@ CHECKERS=16
 NOTIFY=1
 LOG_MAX_MB=50           # rotate the log once it grows past this; 0 = never
 LOG_KEEP=3              # rotated generations to keep (loudsync.log.1 .. .N)
+FAST_LIST=1             # list the remote recursively in few calls (--fast-list)
+FULL_SYNC_SECONDS=300   # with --if-needed: longest wait between full passes
 
 if [ -f "${CONFIG_FILE}" ]; then
     # shellcheck source=/dev/null
@@ -99,6 +103,16 @@ BASE_MD5="${STATE_HOME}/filters-base.md5"
 # How many runs in a row were postponed because the folder was being written to.
 QUIET_SKIPS="${STATE_HOME}/quiet-skips"
 
+# Somebody asked for a full pass: the watcher, when a change was not something
+# the fast lane could send on its own. Removed when a pass starts, so a request
+# that arrives while one is running survives to trigger the next.
+SYNC_REQUESTED="${STATE_HOME}/sync-requested"
+# When the last good pass started (epoch seconds). It is the "since" of the
+# remote probe and the clock FULL_SYNC_SECONDS is measured against. The START
+# of the pass, not its end: what changed remotely while it was running was
+# not necessarily in the listing it worked from.
+LAST_RUN_START="${STATE_HOME}/last-run-start"
+
 # Files that were still being written while the previous run was uploading
 # them. Kept because they are the evidence that a conflict on the NEXT run is
 # this machine racing itself rather than an edit from somewhere else.
@@ -118,6 +132,10 @@ TODAY="$(date +%Y-%m-%d)"
 LOCAL_VERSIONS_DIR="${STATE_HOME}/versions/${TODAY}"
 
 mkdir -p "${STATE_HOME}" "${CONFIG_HOME}"
+# The log names every file you sync, and versions/ holds copies of them. On
+# most systems the parent directory already keeps other users out; this does
+# not depend on that.
+chmod 700 "${STATE_HOME}" 2>/dev/null || true
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') | $*" >>"${LOG}"; }
 
@@ -226,6 +244,11 @@ if [ "${1:-}" = "--status" ]; then
     if [ -s "${REPOS_PREVIOUS}" ]; then
         echo "  excluded git repos: $(wc -l <"${REPOS_PREVIOUS}")"
     fi
+    if [ -s "${STATE_HOME}/fast-lane-off" ]; then
+        echo "  fast lane: standing down, $(cat "${STATE_HOME}/fast-lane-off")"
+    elif [ -s "${STATE_HOME}/last-fast-upload" ]; then
+        echo "  fast lane: last direct upload $(date -d "@$(cat "${STATE_HOME}/last-fast-upload")" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo unknown)"
+    fi
     SKIPPED="$(cat "${QUIET_SKIPS}" 2>/dev/null || echo 0)"
     if [ "${SKIPPED}" -gt 0 ]; then
         echo "  postponed: ${SKIPPED} run(s) in a row, the folder is being written to"
@@ -273,6 +296,7 @@ DRY=0
 WANTS_RESYNC=0
 RENAME_MODE=0
 FORCE_NOW=0
+IF_NEEDED=0
 YES_ARGS=()
 ARGS=()
 for arg in "$@"; do
@@ -281,10 +305,67 @@ for arg in "$@"; do
         --resync)           WANTS_RESYNC=1; ARGS+=("${arg}") ;;
         --propagate-rename) RENAME_MODE=1 ;;
         --now)              FORCE_NOW=1 ;;
+        --if-needed)        IF_NEEDED=1 ;;
         --yes|-y)           YES_ARGS=(--yes) ;;
         *)                                 ARGS+=("${arg}") ;;
     esac
 done
+
+# --- Is a full pass needed at all? ------------------------------------------
+#
+# A full pass lists both sides top to bottom, and against a cloud provider the
+# listing is the whole cost: about a minute on the author's Drive, most of it
+# spent learning that nothing changed. Running one every minute regardless
+# also keeps the lock taken half of the time, which is what makes a file you
+# just saved wait.
+#
+# So the timer and the watcher call this with --if-needed, and a pass runs
+# only when there is a reason for one:
+#
+#   - somebody asked (the watcher: a deletion, a rename, a bulk change, or
+#     anything else the fast lane would not send on its own),
+#   - the last attempt failed, so it is retried exactly as before,
+#   - the remote has changes this machine has not seen (one cheap query; see
+#     loudsync-fast probe),
+#   - or FULL_SYNC_SECONDS went by. The probe does not see everything: a file
+#     deleted or renamed on the remote, or uploaded from a machine that was
+#     offline when it was edited, shows up only in a listing. This is the
+#     bound on how long those can wait.
+#
+# A remote that cannot be probed gets a pass on every tick, which is exactly
+# what this tool did before the probe existed. Running without the flag
+# (by hand, or from the interface) always syncs.
+FAST_HELPER="$(dirname "$(readlink -f "$0")")/loudsync-fast"
+if [ "${IF_NEEDED}" -eq 1 ] && [ "${DRY}" -eq 0 ] && [ "${WANTS_RESYNC}" -eq 0 ] \
+   && [ "${RENAME_MODE}" -eq 0 ] && [ "${FORCE_NOW}" -eq 0 ]; then
+    NOW_S="$(date +%s)"
+    LAST_GOOD="$(cat "${LAST_RUN_START}" 2>/dev/null || echo 0)"
+    case "${LAST_GOOD}" in ''|*[!0-9]*) LAST_GOOD=0 ;; esac
+    NEEDED=0
+    if [ -e "${SYNC_REQUESTED}" ] || [ "$(read_failures)" -gt 0 ] \
+       || [ "$(cat "${QUIET_SKIPS}" 2>/dev/null || echo 0)" -gt 0 ] \
+       || [ $(( NOW_S - LAST_GOOD )) -ge "${FULL_SYNC_SECONDS}" ]; then
+        NEEDED=1
+    elif [ -f "${FAST_HELPER}" ]; then
+        set +e
+        python3 "${FAST_HELPER}" probe "${RCLONE_BIN}" "${LOCAL_DIR}" "${REMOTE}" \
+            --state-dir "${STATE_HOME}" --log "${LOG}" >/dev/null 2>&1
+        PROBE=$?
+        set -e
+        # 20 = nothing new, 22 = could not ask right now. Everything else
+        # (changes found, a remote that can't be probed, a helper that
+        # crashed) falls on the side of syncing.
+        case ${PROBE} in
+            20|22) ;;
+            *)   NEEDED=1 ;;
+        esac
+    else
+        NEEDED=1
+    fi
+    # Says nothing when there is nothing to do: this runs every few seconds,
+    # and a log full of "nothing to do" is a log nobody opens.
+    [ "${NEEDED}" -eq 1 ] || exit 0
+fi
 
 # --- Don't sync a folder that is being written to ---------------------------
 #
@@ -756,6 +837,20 @@ report_conflicts() {
 
 # --- Sync -------------------------------------------------------------------
 
+# From here on a pass is really happening. A request made after this point
+# is about something this pass may not have seen, so it has to survive it.
+if [ "${DRY}" -eq 0 ]; then
+    rm -f "${SYNC_REQUESTED}"
+fi
+
+FASTLIST=()
+if [ "${FAST_LIST}" -eq 1 ]; then
+    # One recursive listing instead of one request per directory. On a remote
+    # with thousands of folders this is the difference between minutes and
+    # seconds; backends without recursive listing ignore it.
+    FASTLIST=(--fast-list)
+fi
+
 log "===== START (${REPO_COUNT} repos excluded) ====="
 
 LOG_OFFSET="$(stat -c %s "${LOG}" 2>/dev/null || echo 0)"
@@ -784,7 +879,7 @@ set +e
     --checkers "${CHECKERS}" \
     --log-file "${LOG}" \
     --log-level INFO \
-    "${BACKUP[@]}" "${EXTRA[@]}" "${ARGS[@]}"
+    "${FASTLIST[@]}" "${BACKUP[@]}" "${EXTRA[@]}" "${ARGS[@]}"
 STATUS=$?
 set -e
 
@@ -807,6 +902,7 @@ if [ ${STATUS} -eq 0 ]; then
     if [ "${DRY}" -eq 0 ]; then
         cp -f "${REPOS_CURRENT}" "${REPOS_PREVIOUS}"
         printf '%s\n' "${BASE_MD5_NOW}" >"${BASE_MD5}"
+        printf '%s\n' "${RUN_STARTED}" >"${LAST_RUN_START}"
     fi
 
     if [ "${AUTO_RESYNC}" -eq 1 ]; then
